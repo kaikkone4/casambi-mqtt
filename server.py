@@ -234,8 +234,12 @@ async def main() -> None:
                 async with client:
                     await client.subscribe(f"{TOPIC_PREFIX}/{NETWORK_NAME}/commands")
 
-                    casa.registerUnitChangedHandler(callback)
+                    # Publish the baseline before registering live updates.
+                    # Casambi can emit a burst of initial UnitChanged callbacks
+                    # during registration; handling that burst concurrently would
+                    # recreate the MQTT queue exhaustion this snapshot avoids.
                     await publish_entities(casa, client)
+                    casa.registerUnitChangedHandler(callback)
 
                     LOGGER.info(
                         "Subscribed to commands topic and UnitChangedHandler registered"
