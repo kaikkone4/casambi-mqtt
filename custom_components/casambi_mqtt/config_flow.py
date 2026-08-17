@@ -3,6 +3,7 @@ from __future__ import annotations
 from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
+    from homeassistant.core import HomeAssistant
     from homeassistant.data_entry_flow import FlowResult
 
 import voluptuous as vol
@@ -10,13 +11,30 @@ from homeassistant.core import callback
 
 from homeassistant import config_entries
 
-from .const import CONF_NETWORK_NAME, DEFAULT_NETWORK_NAME, DOMAIN
+from .const import (
+    CONF_NETWORK_NAME,
+    DEFAULT_NETWORK_NAME,
+    DOMAIN,
+    configured_network_name,
+    is_valid_network_name,
+)
+
+
+def configured_network_names(
+    hass: HomeAssistant, exclude_entry_id: str | None = None
+) -> set[str]:
+    """Return every configured literal Casambi MQTT namespace."""
+    return {
+        configured_network_name(candidate.options, candidate.data)
+        for candidate in hass.config_entries.async_entries(DOMAIN)
+        if candidate.entry_id != exclude_entry_id
+    }
 
 
 class CasambiMqttConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
     """Casambi MQTT config flow."""
 
-    VERSION = 1
+    VERSION = 2
 
     async def async_step_user(
         self, user_input: dict[str, Any] | None = None
@@ -25,11 +43,18 @@ class CasambiMqttConfigFlow(config_entries.ConfigFlow, domain=DOMAIN):
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            # Save configuration and create entry
-            return self.async_create_entry(
-                title=user_input[CONF_NETWORK_NAME],
-                data={CONF_NETWORK_NAME: user_input[CONF_NETWORK_NAME]},
-            )
+            network_name = user_input[CONF_NETWORK_NAME]
+            if not is_valid_network_name(network_name):
+                errors[CONF_NETWORK_NAME] = "invalid_network_name"
+            elif network_name in configured_network_names(self.hass):
+                errors[CONF_NETWORK_NAME] = "network_name_in_use"
+            else:
+                await self.async_set_unique_id(network_name)
+                self._abort_if_unique_id_configured()
+                return self.async_create_entry(
+                    title=network_name,
+                    data={CONF_NETWORK_NAME: network_name},
+                )
 
         data_schema = vol.Schema(
             {
@@ -62,17 +87,24 @@ class CasambiMqttOptionsFlow(config_entries.OptionsFlow):
         errors: dict[str, str] = {}
 
         if user_input is not None:
-            # Update the entry with the new network name
-            return self.async_create_entry(
-                title="THISI STHE TITLE!",
-                data={CONF_NETWORK_NAME: user_input[CONF_NETWORK_NAME]},
+            network_name = user_input[CONF_NETWORK_NAME]
+            other_network_names = configured_network_names(
+                self.hass, self.entry.entry_id
             )
+            if not is_valid_network_name(network_name):
+                errors[CONF_NETWORK_NAME] = "invalid_network_name"
+            elif network_name in other_network_names:
+                errors[CONF_NETWORK_NAME] = "network_name_in_use"
+            else:
+                self.hass.config_entries.async_update_entry(
+                    self.entry, unique_id=network_name
+                )
+                return self.async_create_entry(
+                    title=network_name,
+                    data={CONF_NETWORK_NAME: network_name},
+                )
 
-        current_name: str = (
-            self.entry.options.get(CONF_NETWORK_NAME)
-            or self.entry.data.get(CONF_NETWORK_NAME)
-            or DEFAULT_NETWORK_NAME
-        )
+        current_name: str = configured_network_name(self.entry.options, self.entry.data)
 
         data_schema = vol.Schema(
             {

@@ -12,7 +12,14 @@ ROOT = Path(__file__).resolve().parents[1]
 def load_server_module():
     """Load server.py without requiring the platform BLE dependency in CI."""
     fake_casambi = types.ModuleType("CasambiBt")
-    for name in ("UnitControlType", "UnitControl", "UnitType", "UnitState", "Unit", "Scene"):
+    for name in (
+        "UnitControlType",
+        "UnitControl",
+        "UnitType",
+        "UnitState",
+        "Unit",
+        "Scene",
+    ):
         setattr(fake_casambi, name, type(name, (), {}))
     fake_casambi.Casambi = type("Casambi", (), {})
 
@@ -30,14 +37,27 @@ def load_server_module():
         for package, package_path in (
             ("custom_components", ROOT / "custom_components"),
             ("custom_components.casambi_mqtt", ROOT / "custom_components/casambi_mqtt"),
-            ("custom_components.casambi_mqtt.entities", ROOT / "custom_components/casambi_mqtt/entities"),
+            (
+                "custom_components.casambi_mqtt.entities",
+                ROOT / "custom_components/casambi_mqtt/entities",
+            ),
         ):
             module = types.ModuleType(package)
             module.__path__ = [str(package_path)]
             sys.modules[package] = module
         for name, source in (
-            ("custom_components.casambi_mqtt.entities.commands", ROOT / "custom_components/casambi_mqtt/entities/commands.py"),
-            ("custom_components.casambi_mqtt.entities.entities", ROOT / "custom_components/casambi_mqtt/entities/entities.py"),
+            (
+                "custom_components.casambi_mqtt.const",
+                ROOT / "custom_components/casambi_mqtt/const.py",
+            ),
+            (
+                "custom_components.casambi_mqtt.entities.commands",
+                ROOT / "custom_components/casambi_mqtt/entities/commands.py",
+            ),
+            (
+                "custom_components.casambi_mqtt.entities.entities",
+                ROOT / "custom_components/casambi_mqtt/entities/entities.py",
+            ),
         ):
             spec = importlib.util.spec_from_file_location(name, source)
             assert spec and spec.loader
@@ -45,7 +65,9 @@ def load_server_module():
             sys.modules[name] = module
             spec.loader.exec_module(module)
 
-        spec = importlib.util.spec_from_file_location("casambi_server_test", ROOT / "server.py")
+        spec = importlib.util.spec_from_file_location(
+            "casambi_server_test", ROOT / "server.py"
+        )
         assert spec and spec.loader
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
@@ -98,6 +120,14 @@ class FakeCasa:
     def __init__(self):
         self.units = [FakeUnit("unit-a", "A", 0), FakeUnit("unit-b", "B", 128)]
         self.scenes = [FakeScene(1, "Scene one"), FakeScene(2, "Scene two")]
+        self.set_level_calls = []
+
+    async def setLevel(self, unit, value):
+        self.set_level_calls.append((unit, value))
+
+
+def command_message(payload: bytes) -> types.SimpleNamespace:
+    return types.SimpleNamespace(payload=payload, topic="casambi/default/commands")
 
 
 class RecordingMqttClient:
@@ -123,12 +153,16 @@ async def test_publish_entities_publishes_units_and_scenes_sequentially(server):
     assert published == (2, 2)
     assert client.max_in_flight == 1
     assert [topic for topic, _ in client.messages] == [
+        "casambi/default/events/",
         "casambi/default/events/unit-a",
         "casambi/default/events/unit-b",
         "casambi/default/scenes/1",
         "casambi/default/scenes/2",
     ]
-    assert all(kwargs["qos"] == 1 and kwargs["retain"] is True for _, kwargs in client.messages)
+    assert client.messages[0][1] == {"payload": b"", "qos": 1, "retain": True}
+    assert all(
+        kwargs["qos"] == 1 and kwargs["retain"] is True for _, kwargs in client.messages
+    )
 
 
 @pytest.mark.asyncio
@@ -142,15 +176,131 @@ async def test_publish_entities_handles_missing_unit_state(server):
 
     await server.publish_entities(casa, client)
 
-    assert client.messages[0][0] == "casambi/default/events/unit-no-state"
-    assert '"dimmer": null' in client.messages[0][1]["payload"]
+    assert client.messages[1][0] == "casambi/default/events/unit-no-state"
+    assert '"dimmer": null' in client.messages[1][1]["payload"]
 
 
 @pytest.mark.asyncio
 async def test_process_command_ignores_malformed_payload(server):
     client = RecordingMqttClient()
-    message = types.SimpleNamespace(payload=b"{not-json")
+    message = command_message(b"{not-json")
 
     await server.process_command(message, FakeCasa(), client)
 
     assert client.messages == []
+
+
+@pytest.mark.asyncio
+async def test_addressless_units_publish_to_distinct_uuid_topics(server):
+    first = FakeUnit("", "First", 10)
+    first.uuid = "uuid/first"
+    second = FakeUnit("", "Second", 20)
+    second.uuid = "uuid second"
+    casa = FakeCasa()
+    casa.units = [first, second]
+    casa.scenes = []
+    client = RecordingMqttClient()
+
+    published = await server.publish_entities(casa, client)
+
+    assert published == (2, 0)
+    assert [topic for topic, _ in client.messages] == [
+        "casambi/default/events/",
+        "casambi/default/events/uuid/uuid%2Ffirst",
+        "casambi/default/events/uuid/uuid%20second",
+    ]
+    assert all(
+        '"address": ""' in payload["payload"] for _, payload in client.messages[1:]
+    )
+
+
+@pytest.mark.asyncio
+async def test_set_level_resolves_addressless_unit_by_uuid(server):
+    first = FakeUnit("", "First", 0)
+    first.uuid = "uuid-first"
+    second = FakeUnit("", "Second", 0)
+    second.uuid = "uuid-second"
+    casa = FakeCasa()
+    casa.units = [first, second]
+
+    message = types.SimpleNamespace(
+        payload=b'{"action":"SET_LEVEL","address":"","unit_uuid":"uuid-second","value":128}'
+    )
+    await server.process_command(message, casa, RecordingMqttClient())
+
+    assert casa.set_level_calls == [(second, 128)]
+
+
+@pytest.mark.asyncio
+async def test_set_level_rejects_uuid_address_mismatch(server):
+    unit = FakeUnit("real-address", "A", 0)
+    unit.uuid = "uuid-a"
+    casa = FakeCasa()
+    casa.units = [unit]
+
+    message = types.SimpleNamespace(
+        payload=b'{"action":"SET_LEVEL","address":"wrong-address","unit_uuid":"uuid-a","value":128}'
+    )
+    await server.process_command(message, casa, RecordingMqttClient())
+
+    assert casa.set_level_calls == []
+
+
+@pytest.mark.asyncio
+async def test_duplicate_addressless_uuid_is_never_published_or_commanded(server):
+    first = FakeUnit("", "First", 10)
+    second = FakeUnit("", "Second", 20)
+    first.uuid = second.uuid = "duplicate"
+    casa = FakeCasa()
+    casa.units = [first, second]
+    casa.scenes = []
+    client = RecordingMqttClient()
+
+    assert await server.publish_entities(casa, client) == (0, 0)
+    assert [topic for topic, _ in client.messages] == ["casambi/default/events/"]
+
+    message = types.SimpleNamespace(
+        payload=b'{"action":"SET_LEVEL","address":"","unit_uuid":"duplicate","value":128}'
+    )
+    await server.process_command(message, casa, client)
+    assert casa.set_level_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("payload", [b"[]", b"null", b'"text"'])
+async def test_process_command_ignores_non_object_json(server, payload):
+    casa = FakeCasa()
+    await server.process_command(
+        types.SimpleNamespace(payload=payload), casa, RecordingMqttClient()
+    )
+    assert casa.set_level_calls == []
+
+
+@pytest.mark.asyncio
+async def test_process_command_ignores_unexpected_topic(server):
+    casa = FakeCasa()
+    message = command_message(b'{"action":"SET_LEVEL","address":"unit-a","value":128}')
+    message.topic = "casambi/other/commands"
+    await server.process_command(message, casa, RecordingMqttClient())
+    assert casa.set_level_calls == []
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "payload",
+    [
+        b'{"action":"SET_LEVEL","address":"unit-a"}',
+        b'{"action":"SET_LEVEL","address":"unit-a","value":"128"}',
+        b'{"action":"SET_LEVEL","address":"unit-a","value":256}',
+        b'{"action":"SET_LEVEL","address":"unit-a","value":1,"extra":true}',
+        b'{"action":"SET_LEVEL","address":"","value":1}',
+        b'{"action":"TURN_ON"}',
+        b'{"action":"SET_SCENE"}',
+    ],
+)
+async def test_process_command_ignores_invalid_command_schema(server, payload):
+    casa = FakeCasa()
+    await server.process_command(
+        types.SimpleNamespace(payload=payload), casa, RecordingMqttClient()
+    )
+    assert casa.set_level_calls == []

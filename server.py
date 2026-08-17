@@ -5,12 +5,14 @@ import os
 import sys
 from collections.abc import Awaitable
 from typing import TYPE_CHECKING, Any
+from urllib.parse import quote
 
 import aiomqtt
 import CasambiBt
 from CasambiBt import Casambi, discover
 from dotenv import load_dotenv
 
+from custom_components.casambi_mqtt.const import is_valid_network_name
 from custom_components.casambi_mqtt.entities.commands import (
     PublishEntities,
     SetLevel,
@@ -30,6 +32,7 @@ if TYPE_CHECKING:
     from bleak import BLEDevice
 
 TOPIC_PREFIX = "casambi"
+MAX_BRIGHTNESS = 255
 
 load_dotenv()
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
@@ -109,6 +112,106 @@ def to_scene(scene: CasambiBt.Scene) -> Scene:
     return Scene(scene.sceneId, scene.name)
 
 
+def unit_event_topic(unit: CasambiBt.Unit) -> str | None:
+    """Return a collision-free state topic without changing control address."""
+    if unit.address:
+        return f"{TOPIC_PREFIX}/{NETWORK_NAME}/events/{unit.address}"
+
+    unit_uuid = getattr(unit, "uuid", None)
+    if not isinstance(unit_uuid, str) or not unit_uuid:
+        LOGGER.error("Skipping addressless Casambi unit without a usable UUID")
+        return None
+    return f"{TOPIC_PREFIX}/{NETWORK_NAME}/events/uuid/{quote(unit_uuid, safe='')}"
+
+
+async def publish_unit(unit: CasambiBt.Unit, client: aiomqtt.Client) -> bool:
+    """Publish one retained unit state using the same topic for all paths."""
+    topic = unit_event_topic(unit)
+    if topic is None:
+        return False
+    entity = to_entity(unit)
+    await log_exceptions(
+        client.publish(topic, payload=entity.to_json(), qos=1, retain=True)
+    )
+    return True
+
+
+def command_unit(casa: Casambi, address: str, unit_uuid: str | None) -> CasambiBt.Unit:
+    """Resolve an unambiguous command target without synthetic addresses."""
+    if unit_uuid is None:
+        if not address:
+            message = "Addressless Casambi commands require a unit UUID"
+            raise ValueError(message)
+        units = [unit for unit in casa.units if unit.address == address]
+    else:
+        units = [unit for unit in casa.units if unit.uuid == unit_uuid]
+    if len(units) != 1:
+        message = "Command target does not resolve to exactly one Casambi unit"
+        raise ValueError(message)
+    unit = units[0]
+    if unit_uuid is not None and unit.address != address:
+        message = "Command UUID does not match its Casambi address"
+        raise ValueError(message)
+    return unit
+
+
+def validate_light_command(address: object, unit_uuid: object) -> None:
+    if not isinstance(address, str):
+        message = "Casambi command address must be a string"
+        raise TypeError(message)
+    if unit_uuid is not None and (not isinstance(unit_uuid, str) or not unit_uuid):
+        message = "Casambi command UUID must be a non-empty string or null"
+        raise TypeError(message)
+
+
+def validate_integer(value: object, name: str) -> int:
+    if not isinstance(value, int) or isinstance(value, bool):
+        message = f"Casambi {name} must be an integer"
+        raise TypeError(message)
+    return value
+
+
+def validate_brightness(value: object) -> int:
+    value = validate_integer(value, "brightness value")
+    if not 0 <= value <= MAX_BRIGHTNESS:
+        message = "Casambi brightness value must be between 0 and 255"
+        raise ValueError(message)
+    return value
+
+
+def addressless_unit_uuid_is_unique(casa: Casambi, unit: CasambiBt.Unit) -> bool:
+    """Return whether an addressless unit has one usable UUID in this network."""
+    if unit.address or not isinstance(getattr(unit, "uuid", None), str):
+        return False
+    return (
+        sum(
+            not candidate.address and candidate.uuid == unit.uuid
+            for candidate in casa.units
+        )
+        == 1
+    )
+
+
+def validate_command_keys(command: dict[str, object], action: str) -> None:
+    allowed_keys = {
+        SetLevel.ACTION: {"action", "address", "value", "unit_uuid"},
+        TurnOn.ACTION: {"action", "address", "unit_uuid"},
+        PublishEntities.ACTION: {"action"},
+        SetScene.ACTION: {"action", "scene_id"},
+    }
+    required_keys = {
+        SetLevel.ACTION: {"action", "address", "value"},
+        TurnOn.ACTION: {"action", "address"},
+        PublishEntities.ACTION: {"action"},
+        SetScene.ACTION: {"action", "scene_id"},
+    }
+    if action not in allowed_keys:
+        return
+    if set(command) - allowed_keys[action] or not required_keys[action] <= set(command):
+        message = "Casambi command has an invalid schema"
+        raise ValueError(message)
+
+
 async def publish_entities(casa: Casambi, client: aiomqtt.Client) -> tuple[int, int]:
     """
     Publish the current Casambi snapshot, one QoS message at a time.
@@ -119,18 +222,34 @@ async def publish_entities(casa: Casambi, client: aiomqtt.Client) -> tuple[int, 
     """
     units_published = 0
     scenes_published = 0
+    addressless_uuid_counts: dict[str, int] = {}
+    for unit in casa.units:
+        if not unit.address and isinstance(getattr(unit, "uuid", None), str):
+            addressless_uuid_counts[unit.uuid] = (
+                addressless_uuid_counts.get(unit.uuid, 0) + 1
+            )
+
+    # Clear the retained legacy collision before publishing UUID-keyed units.
+    await log_exceptions(
+        client.publish(
+            f"{TOPIC_PREFIX}/{NETWORK_NAME}/events/",
+            payload=b"",
+            qos=1,
+            retain=True,
+        )
+    )
 
     for unit in casa.units:
-        entity = to_entity(unit)
-        await log_exceptions(
-            client.publish(
-                f"{TOPIC_PREFIX}/{NETWORK_NAME}/events/{unit.address}",
-                payload=entity.to_json(),
-                qos=1,
-                retain=True,
-            )
-        )
-        units_published += 1
+        if not unit.address:
+            unit_uuid = getattr(unit, "uuid", None)
+            if (
+                not isinstance(unit_uuid, str)
+                or addressless_uuid_counts.get(unit_uuid) != 1
+            ):
+                LOGGER.error("Skipping addressless Casambi unit with non-unique UUID")
+                continue
+        if await publish_unit(unit, client):
+            units_published += 1
 
     for scene in casa.scenes:
         scene_entity = to_scene(scene)
@@ -155,11 +274,19 @@ async def publish_entities(casa: Casambi, client: aiomqtt.Client) -> tuple[int, 
 async def process_command(
     message: aiomqtt.Message, casa: Casambi, client: aiomqtt.Client
 ) -> None:
+    expected_topic = f"{TOPIC_PREFIX}/{NETWORK_NAME}/commands"
+    if hasattr(message, "topic") and str(message.topic) != expected_topic:
+        LOGGER.warning("Ignoring command received on an unexpected MQTT topic")
+        return
     try:
         payload = message.payload.decode()
         command = json.loads(payload)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
         LOGGER.warning("Ignoring malformed MQTT command: %s", error)
+        return
+
+    if not isinstance(command, dict):
+        LOGGER.warning("Ignoring MQTT command with a non-object JSON payload")
         return
 
     action = command.get("action")
@@ -168,28 +295,37 @@ async def process_command(
         return
 
     try:
+        validate_command_keys(command, action)
         match action:
             case SetLevel.ACTION:
                 cmd = SetLevel.from_json(payload)
-                unit = next(u for u in casa.units if u.address == cmd.address)
-                await casa.setLevel(unit, cmd.value)
+                validate_light_command(cmd.address, cmd.unit_uuid)
+                value = validate_brightness(cmd.value)
+                unit = command_unit(casa, cmd.address, cmd.unit_uuid)
+                await casa.setLevel(unit, value)
             case TurnOn.ACTION:
                 cmd = TurnOn.from_json(payload)
-                unit = next(u for u in casa.units if u.address == cmd.address)
+                validate_light_command(cmd.address, cmd.unit_uuid)
+                unit = command_unit(casa, cmd.address, cmd.unit_uuid)
                 await casa.turnOn(unit)
             case PublishEntities.ACTION:
                 await publish_entities(casa, client)
             case SetScene.ACTION:
                 cmd = SetScene.from_json(payload)
-                scene = next(s for s in casa.scenes if s.sceneId == cmd.scene_id)
+                scene_id = validate_integer(cmd.scene_id, "scene ID")
+                scene = next(s for s in casa.scenes if s.sceneId == scene_id)
                 await casa.switchToScene(scene)
             case _:
                 LOGGER.warning("Ignoring unknown Casambi command action: %s", action)
-    except (KeyError, StopIteration, ValueError) as error:
+    except (AttributeError, KeyError, StopIteration, TypeError, ValueError) as error:
         LOGGER.warning("Unable to process Casambi command %s: %s", action, error)
 
 
 async def main() -> None:
+    if not is_valid_network_name(NETWORK_NAME):
+        message = "CASAMBI_NETWORK_NAME must be one literal, non-empty MQTT topic level"
+        raise RuntimeError(message)
+
     devices = await discover()
     device: BLEDevice | None = None
     for d in devices:
@@ -215,17 +351,12 @@ async def main() -> None:
         interval = 5
 
         def callback(unit: CasambiBt.Unit) -> None:
-            entity = to_entity(unit)
-            task = asyncio.create_task(
-                log_exceptions(
-                    client.publish(
-                        f"{TOPIC_PREFIX}/{NETWORK_NAME}/events/{unit.address}",
-                        payload=entity.to_json(),
-                        qos=1,
-                        retain=True,
-                    )
+            if not unit.address and not addressless_unit_uuid_is_unique(casa, unit):
+                LOGGER.error(
+                    "Skipping live addressless unit update with non-unique UUID"
                 )
-            )
+                return
+            task = asyncio.create_task(publish_unit(unit, client))
             background_tasks.add(task)
             task.add_done_callback(background_tasks.discard)
 
