@@ -25,6 +25,14 @@ jobs:
         - name: "Install requirements"
           run: python3 -m pip install -r requirements.txt
 
+        - name: "Run bridge unit tests"
+          run: |
+            python3 -m pip install -r requirements-dev.txt
+            pytest -q
+
+        - name: "Syntax check"
+          run: python3 -m py_compile server.py
+
         - name: "Lint"
           run: python3 -m ruff check .
 

@@ -79,7 +79,16 @@ def to_unit_type(t: CasambiBt.UnitType) -> UnitType:
     )
 
 
-def to_unit_state(s: CasambiBt.UnitState) -> UnitState:
+def to_unit_state(s: CasambiBt.UnitState | None) -> UnitState:
+    """
+    Map the optional Casambi state without crashing the bridge.
+
+    Some non-dimmable / partially discovered units report no state. They are
+    still published for discovery, but a missing dimmer must not take down the
+    entire MQTT bridge.
+    """
+    if s is None or not hasattr(s, "dimmer"):
+        return UnitState(None)
     return UnitState(s.dimmer)
 
 
@@ -100,39 +109,84 @@ def to_scene(scene: CasambiBt.Scene) -> Scene:
     return Scene(scene.sceneId, scene.name)
 
 
+async def publish_entities(casa: Casambi, client: aiomqtt.Client) -> tuple[int, int]:
+    """
+    Publish the current Casambi snapshot, one QoS message at a time.
+
+    A reconnect/startup sync can contain dozens of units. Awaiting each publish
+    deliberately avoids overflowing aiomqtt's pending-publish queue, which can
+    otherwise leave Home Assistant with stale retained state.
+    """
+    units_published = 0
+    scenes_published = 0
+
+    for unit in casa.units:
+        entity = to_entity(unit)
+        await log_exceptions(
+            client.publish(
+                f"{TOPIC_PREFIX}/{NETWORK_NAME}/events/{unit.address}",
+                payload=entity.to_json(),
+                qos=1,
+                retain=True,
+            )
+        )
+        units_published += 1
+
+    for scene in casa.scenes:
+        scene_entity = to_scene(scene)
+        await log_exceptions(
+            client.publish(
+                f"{TOPIC_PREFIX}/{NETWORK_NAME}/scenes/{scene_entity.scene_id}",
+                payload=scene_entity.to_json(),
+                qos=1,
+                retain=True,
+            )
+        )
+        scenes_published += 1
+
+    LOGGER.info(
+        "Published Casambi state snapshot: %d units, %d scenes",
+        units_published,
+        scenes_published,
+    )
+    return units_published, scenes_published
+
+
 async def process_command(
     message: aiomqtt.Message, casa: Casambi, client: aiomqtt.Client
 ) -> None:
-    payload = message.payload.decode()
-    command = json.loads(payload)
-    match command["action"]:
-        case SetLevel.ACTION:
-            cmd = SetLevel.from_json(payload)
-            unit = next(u for u in casa.units if u.address == cmd.address)
-            await casa.setLevel(unit, cmd.value)
-        case TurnOn.ACTION:
-            cmd = TurnOn.from_json(payload)
-            unit = next(u for u in casa.units if u.address == cmd.address)
-            await casa.turnOn(unit)
-        case PublishEntities.ACTION:
-            for scene in casa.scenes:
-                scene_entity = to_scene(scene)
-                task = asyncio.create_task(
-                    log_exceptions(
-                        client.publish(
-                            f"{TOPIC_PREFIX}/{NETWORK_NAME}/scenes/{scene_entity.scene_id}",
-                            payload=scene_entity.to_json(),
-                            qos=1,
-                            retain=True,
-                        )
-                    )
-                )
-                background_tasks.add(task)
-                task.add_done_callback(background_tasks.discard)
-        case SetScene.ACTION:
-            cmd = SetScene.from_json(payload)
-            scene = next(s for s in casa.scenes if s.sceneId == cmd.scene_id)
-            await casa.switchToScene(scene)
+    try:
+        payload = message.payload.decode()
+        command = json.loads(payload)
+    except (UnicodeDecodeError, json.JSONDecodeError) as error:
+        LOGGER.warning("Ignoring malformed MQTT command: %s", error)
+        return
+
+    action = command.get("action")
+    if not isinstance(action, str):
+        LOGGER.warning("Ignoring MQTT command without an action")
+        return
+
+    try:
+        match action:
+            case SetLevel.ACTION:
+                cmd = SetLevel.from_json(payload)
+                unit = next(u for u in casa.units if u.address == cmd.address)
+                await casa.setLevel(unit, cmd.value)
+            case TurnOn.ACTION:
+                cmd = TurnOn.from_json(payload)
+                unit = next(u for u in casa.units if u.address == cmd.address)
+                await casa.turnOn(unit)
+            case PublishEntities.ACTION:
+                await publish_entities(casa, client)
+            case SetScene.ACTION:
+                cmd = SetScene.from_json(payload)
+                scene = next(s for s in casa.scenes if s.sceneId == cmd.scene_id)
+                await casa.switchToScene(scene)
+            case _:
+                LOGGER.warning("Ignoring unknown Casambi command action: %s", action)
+    except (KeyError, StopIteration, ValueError) as error:
+        LOGGER.warning("Unable to process Casambi command %s: %s", action, error)
 
 
 async def main() -> None:
@@ -181,6 +235,7 @@ async def main() -> None:
                     await client.subscribe(f"{TOPIC_PREFIX}/{NETWORK_NAME}/commands")
 
                     casa.registerUnitChangedHandler(callback)
+                    await publish_entities(casa, client)
 
                     LOGGER.info(
                         "Subscribed to commands topic and UnitChangedHandler registered"
