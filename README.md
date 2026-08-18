@@ -1,73 +1,89 @@
-# Home Assistant integration for Casambi using MQTT
+# Casambi MQTT for Home Assistant
 
-This is a Home Assistant integration for Casambi networks. It uses the 
-[unofficial Casambi Bluetooth](https://github.com/lkempf/casambi-bt)
-library, but unlike the [Casambi Bluetooth HA integration](https://github.com/lkempf/casambi-bt-hass/)
-from the same author as the library, it introduces MQTT as a middleman between the library and Home Assistant.
-This allows you to run the library on a different device than Home Assistant.
+A local-push Home Assistant integration for Casambi networks. A separate Bluetooth bridge publishes Casambi unit and scene state to MQTT; Home Assistant consumes those topics and sends control commands back through MQTT. This lets the Bluetooth bridge run on a different Linux host from Home Assistant.
 
-## Why?
+> This project uses the unofficial [casambi-bt](https://github.com/lkempf/casambi-bt) library. It currently supports dimmable lights and scenes.
 
-Because the device where I run Home Assistant on does not have Bluetooth :)
+## Architecture and requirements
 
-Does your Home Assistant hardware have bluetooth? Then you're probably better off with the
-[Casambi Bluetooth HA integration](https://github.com/lkempf/casambi-bt-hass/), as this version is
-very limited. For now, it only supports dimmable lights, and scenes.
+You need all of the following:
 
-## Setup
+- A configured MQTT broker and Home Assistant's [MQTT integration](https://www.home-assistant.io/integrations/mqtt/)
+- Home Assistant 2025.2.4 or newer
+- A Linux Bluetooth host for the bridge (the host needs Bluetooth access and the relevant Casambi network credentials)
 
-In addition to running this integration in Home Assistant, you need to have the following:
+The Home Assistant custom component and Bluetooth bridge are separate deployments. Installing this repository in HACS does **not** install or start the bridge.
 
-- An MQTT Server
-- The [MQTT integration](https://www.home-assistant.io/integrations/mqtt/) installed and configured in Home Assistant
-- The [server](./server.py) running somewhere with Bluetooth
+## Install the Home Assistant integration with HACS
 
-You need to run the server, as this communicates with your Casambi network over bluetooth. You can do so in two ways:
+This repository is currently distributed as a **HACS custom repository**.
 
-### Running the server using docker compose
+1. In Home Assistant, open **HACS → Integrations**.
+2. Open the three-dot menu → **Custom repositories**.
+3. Add `https://github.com/kaikkone4/casambi-mqtt` with category **Integration**.
+4. Search for **Casambi MQTT** and install the latest release.
+5. Restart Home Assistant.
+6. Go to **Settings → Devices & services → Add integration**, then add **Casambi MQTT**.
+7. Enter the MQTT network name used by the bridge. It must be one literal MQTT topic level (no `/`, `+`, or `#`).
 
-Just create a `docker-compose.yml` file, and specify the casambi server like so:
+For upgrades that include an entity migration, keep the existing config entry and restart Home Assistant. Do not delete and recreate the integration: the migration preserves existing entity IDs and user customizations where safely possible.
 
-```yaml
-services:
-  casambi-server:
-    image: peterklijn/casambi-mqtt-server:0.0.3
-    environment:
-      MQTT_BROKER: "<broker address>"
-      MQTT_USERNAME: "<optional broker username, or remove line>"
-      MQTT_PASSWORD: "<optional broker password, or remove line>"
-      CASAMBI_NETWORK_ADDRESS: "<casambi bluetooth address>"
-      CASAMBI_NETWORK_PASSWORD: "<casambi password>"
-      CASAMBI_NETWORK_NAME: "<optional network name, used in mqtt topic>"
-    privileged: true
-    network_mode: host
-    volumes:
-      - /var/run/dbus:/var/run/dbus
-```
+## Install the Bluetooth bridge from source
 
-Don't know the Casambi Bluetooth address? 
-Run the server and it will list all Casambi networks. 
-
-### Running the server from source
-
-You can also run the server from source, for which you need to clone this repo, copy the `.env.example` file and `.env` and change the values, and start the server.
+A maintained Docker image is not published for this release. Use the tagged source release on the Bluetooth host instead.
 
 ```bash
+git clone --branch v0.2.0 --depth 1 https://github.com/kaikkone4/casambi-mqtt.git
+cd casambi-mqtt
+python3 -m venv .venv
+. .venv/bin/activate
+python -m pip install --upgrade pip
+python -m pip install -r requirements-server.txt
 cp .env.example .env
 ```
-Then change the values in the `.env` file, and run the server.
+
+Set the required MQTT and Casambi values in the local `.env` file. Keep it private: do not commit it or paste its contents into issues. Then start the bridge:
 
 ```bash
 python server.py
 ```
 
-Don't know the Casambi Bluetooth address? 
-Run the server and it will list all Casambi networks. 
+For production, run the bridge under a service manager such as systemd and deploy only signed-off Git tags. Do not point a production bridge at an unreviewed branch.
 
-## Local development
+The bridge logs available Casambi networks when it cannot find a configured network. It publishes state below `casambi/<network>/events/` and `casambi/<network>/scenes/`; commands are accepted at `casambi/<network>/commands`.
 
-1. `docker compose up -d`
-2. Initialize Home Assistant, visit http://localhost:8123, create a user
-3. Install the MQTT integration: On the [integration page](http://localhost:8123/config/integrations/dashboard) add the integration 'MQTT'
-4. Connect to the broker, hostname = 'mosquitto'
-5. Install HACS, follow the instructions mentioned [here](https://www.hacs.xyz/docs/use/download/download/#to-download-hacs-container), connect to the container using `docker exec -ti casambi-mqtt-homeassistant-1 bash`
+### Addressless Casambi units
+
+Some Casambi units do not expose a usable Bluetooth address. For those units, the bridge uses their stable UUID only for MQTT and Home Assistant identity (`events/uuid/<uuid>`). The original Casambi address is retained in the control path. Do not manually create retained payloads on the legacy bare `events/` topic.
+
+## Development
+
+### Bridge tests
+
+```bash
+python -m pip install -r requirements.txt -r requirements-dev.txt
+pytest -q tests/test_server.py
+```
+
+### Home Assistant component tests
+
+The component test environment is intentionally separate from the bridge dependencies because their MQTT dependency versions conflict.
+
+```bash
+uv venv --python 3.13 .venv-ha-test
+. .venv-ha-test/bin/activate
+python -m pip install -r requirements-test.txt
+pytest -q tests/test_light.py tests/test_integration.py tests/test_migration.py -o asyncio_mode=auto
+```
+
+CI runs bridge tests, component tests, Ruff, Hassfest, and HACS validation on every pull request.
+
+## Safety notes
+
+- Do not use test or troubleshooting commands that actuate Casambi units unless you explicitly intend to control them.
+- A safe state-only bridge refresh is the MQTT command `{"action":"PUBLISH_ENTITIES"}`.
+- Do not commit `.env`, Casambi Bluetooth state, credentials, tokens, or hardware-local data.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
