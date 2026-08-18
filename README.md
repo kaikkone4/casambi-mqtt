@@ -30,10 +30,10 @@ For upgrades that include an entity migration, keep the existing config entry an
 
 ## Install the Bluetooth bridge from source
 
-A maintained Docker image is not published for this release. Use the tagged source release on the Bluetooth host instead.
+A maintained Docker image is not published for this release. Use the latest GitHub Release tag in place of `<release-tag>` on the Bluetooth host instead.
 
 ```bash
-git clone --branch v0.2.1 --depth 1 https://github.com/kaikkone4/casambi-mqtt.git
+git clone --branch <release-tag> --depth 1 https://github.com/kaikkone4/casambi-mqtt.git
 cd casambi-mqtt
 python3 -m venv .venv
 . .venv/bin/activate
@@ -48,7 +48,7 @@ Set the required MQTT and Casambi values in the local `.env` file. Keep it priva
 python server.py
 ```
 
-For production, run the bridge under a service manager such as systemd and deploy only signed-off Git tags. Do not point a production bridge at an unreviewed branch.
+For production, run the bridge under a service manager such as systemd and deploy only reviewed release tags. Do not point a production bridge at an unreviewed branch.
 
 The bridge logs available Casambi networks when it cannot find a configured network. It publishes state below `casambi/<network>/events/` and `casambi/<network>/scenes/`; commands are accepted at `casambi/<network>/commands`.
 
@@ -61,7 +61,7 @@ Some Casambi units do not expose a usable Bluetooth address. For those units, th
 ### Bridge tests
 
 ```bash
-python -m pip install -r requirements.txt -r requirements-dev.txt
+python -m pip install -r requirements-server.txt -r requirements-dev.txt
 pytest -q tests/test_server.py
 ```
 
