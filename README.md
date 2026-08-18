@@ -33,7 +33,7 @@ For upgrades that include an entity migration, keep the existing config entry an
 A maintained Docker image is not published for this release. Use the tagged source release on the Bluetooth host instead.
 
 ```bash
-git clone --branch v0.2.0 --depth 1 https://github.com/kaikkone4/casambi-mqtt.git
+git clone --branch v0.2.1 --depth 1 https://github.com/kaikkone4/casambi-mqtt.git
 cd casambi-mqtt
 python3 -m venv .venv
 . .venv/bin/activate

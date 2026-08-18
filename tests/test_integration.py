@@ -10,7 +10,9 @@ from custom_components.casambi_mqtt.const import CONF_NETWORK_NAME, DOMAIN
 from homeassistant.helpers import entity_registry as er
 
 
-def unit_payload(uuid: str, address: str = "") -> str:
+def unit_payload(
+    uuid: str, address: str = "", control_name: str = "DIMMER"
+) -> str:
     return json.dumps(
         {
             "address": address,
@@ -23,7 +25,7 @@ def unit_payload(uuid: str, address: str = "") -> str:
             "unit_type": {
                 "id": 1,
                 "manufacturer": "Casambi",
-                "mode": "Dim",
+                "mode": "Dim" if control_name == "DIMMER" else "Switch",
                 "model": "Test",
                 "state_length": 1,
                 "controls": [
@@ -32,7 +34,7 @@ def unit_payload(uuid: str, address: str = "") -> str:
                         "length": 8,
                         "offset": 0,
                         "readonly": False,
-                        "type": {"name": "DIMMER", "value": 0},
+                        "type": {"name": control_name, "value": 0},
                     }
                 ],
             },
@@ -84,6 +86,62 @@ async def test_addressless_topic_requires_matching_uuid_and_ignores_tombstone(ha
     assert entry.runtime_data.lights[
         "casambi/test/events/uuid/unit-uuid"
     ].unique_id == f"{entry.entry_id}_casambi_mqtt_light_uuid_unit-uuid"
+
+
+@pytest.mark.asyncio
+async def test_non_light_unit_is_ignored_without_invalid_payload_warning(hass, caplog):
+    entry = MockConfigEntry(domain=DOMAIN, data={CONF_NETWORK_NAME: "test"})
+    entry.add_to_hass(hass)
+    subscriptions = []
+
+    async def subscribe(_hass, topic, callback, _qos):
+        subscriptions.append((topic, callback))
+        return lambda: None
+
+    with (
+        patch.object(hass.config_entries, "async_forward_entry_setups", AsyncMock()),
+        patch.object(integration, "async_subscribe", side_effect=subscribe),
+    ):
+        assert await integration.async_setup_entry(hass, entry)
+
+    entry.runtime_data.light_add_entities = Mock()
+    await subscriptions[0][1](
+        SimpleNamespace(
+            topic="casambi/test/events/switch-address",
+            payload=unit_payload("switch-uuid", "switch-address", "SWITCH"),
+        )
+    )
+
+    assert entry.runtime_data.light_add_entities.call_count == 0
+    assert "Invalid Casambi unit payload" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_malformed_unit_type_warns_without_crashing(hass, caplog):
+    entry = MockConfigEntry(domain=DOMAIN, data={CONF_NETWORK_NAME: "test"})
+    entry.add_to_hass(hass)
+    subscriptions = []
+
+    async def subscribe(_hass, topic, callback, _qos):
+        subscriptions.append((topic, callback))
+        return lambda: None
+
+    with (
+        patch.object(hass.config_entries, "async_forward_entry_setups", AsyncMock()),
+        patch.object(integration, "async_subscribe", side_effect=subscribe),
+    ):
+        assert await integration.async_setup_entry(hass, entry)
+
+    malformed = json.loads(unit_payload("unit-uuid", "address"))
+    malformed["unit_type"] = None
+    with pytest.warns(RuntimeWarning, match="unit_type"):
+        await subscriptions[0][1](
+            SimpleNamespace(
+                topic="casambi/test/events/address", payload=json.dumps(malformed)
+            )
+        )
+
+    assert "Invalid Casambi unit payload" in caplog.text
 
 
 def test_legacy_registry_cleanup_is_scoped_to_current_entry(hass):
