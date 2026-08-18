@@ -22,13 +22,11 @@ jobs:
             python-version: "3.13"
             cache: "pip"
 
-        - name: "Install requirements"
-          run: python3 -m pip install -r requirements.txt
+        - name: "Install bridge runtime and test requirements"
+          run: python3 -m pip install -r requirements-server.txt -r requirements-dev.txt
 
         - name: "Run bridge unit tests"
-          run: |
-            python3 -m pip install -r requirements-dev.txt
-            pytest -q tests/test_server.py
+          run: pytest -q tests/test_server.py
 
         - name: "Syntax check"
           run: python3 -m py_compile server.py
