@@ -5,3 +5,4 @@ aiomqtt==2.5.1
 python-dotenv==1.2.2
 pytest==9.1.1
 pytest-asyncio==1.4.0
+ruff==0.15.22
