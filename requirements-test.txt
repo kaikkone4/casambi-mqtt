@@ -1,0 +1,5 @@
+# Home Assistant custom-component integration tests. This intentionally does
+# not include aiomqtt: Home Assistant 2025.2.4 pins paho-mqtt 1.x whereas the
+# bridge's aiomqtt 2.5 uses paho-mqtt 2.x. Bridge and HA tests run separately.
+pytest-homeassistant-custom-component==0.13.214
+dataclasses-json==0.6.7

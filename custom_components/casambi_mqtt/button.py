@@ -6,24 +6,26 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from custom_components.casambi_mqtt.entities.commands import PublishEntities
 
-from .const import CONF_NETWORK_NAME, DOMAIN, LOGGER, MQTT_TOPIC_PREFIX
+from .const import LOGGER, MQTT_TOPIC_PREFIX, entry_scoped_unique_id
 
 
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
-    network_name = hass.data[DOMAIN][CONF_NETWORK_NAME]
-    async_add_entities([CasambiMqttReloadButton(hass, network_name)])
+    network_name = entry.runtime_data.network_name
+    async_add_entities([CasambiMqttReloadButton(hass, network_name, entry.entry_id)])
 
 
 class CasambiMqttReloadButton(ButtonEntity):
     _mqtt_network_name: str
 
-    def __init__(self, hass: HomeAssistant, network_name: str) -> None:
+    def __init__(self, hass: HomeAssistant, network_name: str, entry_id: str) -> None:
         self.hass = hass
         self._mqtt_network_name = network_name
         self._attr_name = "Reload Casambi entities"
-        self._attr_unique_id = "casambi_mqtt_reload_entities"
+        self._attr_unique_id = entry_scoped_unique_id(
+            entry_id, "casambi_mqtt_reload_entities"
+        )
         self._attr_icon = "mdi:cloud-download"
 
     async def async_press(self) -> None:

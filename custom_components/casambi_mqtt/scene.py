@@ -8,25 +8,29 @@ from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
 from custom_components.casambi_mqtt.entities.commands import SetScene
 
-from .const import DOMAIN, MQTT_TOPIC_PREFIX, SCENE_ADD_ENTITIES
+from .const import MQTT_TOPIC_PREFIX, entry_scoped_unique_id
 from .entities.entities import Scene
 
 
 async def async_setup_entry(
     hass: HomeAssistant, entry: ConfigEntry, async_add_entities: AddEntitiesCallback
 ) -> None:
-    hass.data[DOMAIN][SCENE_ADD_ENTITIES] = async_add_entities
+    entry.runtime_data.scene_add_entities = async_add_entities
 
 
 class CasambiMqttScene(HAScene):
     _attr_casambi_id: int
     _mqtt_network_name: str
 
-    def __init__(self, hass: HomeAssistant, network_name: str, scene: Scene) -> None:
+    def __init__(
+        self, hass: HomeAssistant, network_name: str, entry_id: str, scene: Scene
+    ) -> None:
         self.hass = hass
         self._mqtt_network_name = network_name
         self._attr_casambi_id = scene.scene_id
-        self._attr_unique_id = f"casambi_mqtt_scene_{scene.scene_id}"
+        self._attr_unique_id = entry_scoped_unique_id(
+            entry_id, f"casambi_mqtt_scene_{scene.scene_id}"
+        )
         self._attr_name = scene.name
         self._attr_icon = "mdi:lamps"
 

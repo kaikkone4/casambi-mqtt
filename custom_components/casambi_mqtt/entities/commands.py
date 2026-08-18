@@ -27,6 +27,7 @@ class BaseCommand(abc.ABC):
 class SetLevel(BaseCommand):
     address: str
     value: int
+    unit_uuid: str | None = None
     ACTION: ClassVar[str] = "SET_LEVEL"
 
     def _action(self) -> str:
@@ -36,6 +37,7 @@ class SetLevel(BaseCommand):
 @dataclass
 class TurnOn(BaseCommand):
     address: str
+    unit_uuid: str | None = None
     ACTION: ClassVar[str] = "TURN_ON"
 
     def _action(self) -> str:
