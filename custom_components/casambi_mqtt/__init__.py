@@ -129,7 +129,9 @@ async def async_setup_entry(  # noqa: PLR0915
     event_prefix = f"{MQTT_TOPIC_PREFIX}/{network_name}/events/"
     scene_prefix = f"{MQTT_TOPIC_PREFIX}/{network_name}/scenes/"
 
-    async def event_processor(msg: ReceiveMessage) -> None:
+    async def event_processor(  # noqa: PLR0911, PLR0912
+        msg: ReceiveMessage,
+    ) -> None:
         if not msg.payload or not msg.topic.startswith(event_prefix):
             return
         topic_suffix = msg.topic[len(event_prefix) :]
@@ -138,21 +140,26 @@ async def async_setup_entry(  # noqa: PLR0915
         if not topic_suffix:
             return
         unit: Unit | None = None
+        unit_kind: str | None = None
         try:
             unit = Unit.from_json(msg.payload)
-            valid_unit = (
-                unit is not None
-                and isinstance(unit.address, str)
-                and isinstance(unit.uuid, str)
-                and unit.state is not None
-                and isinstance(unit.state.dimmer, int | None)
-                and not isinstance(unit.state.dimmer, bool)
-                and unit.type() == Unit.TYPE_LIGHT
-            )
+            if unit is None:
+                valid_unit = False
+            else:
+                unit_kind = unit.type()
+                valid_unit = (
+                    isinstance(unit.address, str)
+                    and isinstance(unit.uuid, str)
+                    and unit.state is not None
+                    and isinstance(unit.state.dimmer, int | None)
+                    and not isinstance(unit.state.dimmer, bool)
+                )
         except (AttributeError, KeyError, TypeError, ValueError):
             valid_unit = False
         if not valid_unit or unit is None:
             LOGGER.warning("Invalid Casambi unit payload on topic %s", msg.topic)
+            return
+        if unit_kind != Unit.TYPE_LIGHT:
             return
 
         if unit.address:
