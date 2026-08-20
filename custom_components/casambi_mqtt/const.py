@@ -31,6 +31,11 @@ def switch_event_signal(
     return f"{DOMAIN}_{entry_id}_switch_{unit_id}_{button}_{event_type}"
 
 
+def switch_button_signal(entry_id: str, unit_id: int, button: int) -> str:
+    """Name the in-process signal carrying every phase of one button."""
+    return f"{DOMAIN}_{entry_id}_switch_{unit_id}_{button}"
+
+
 def entry_scoped_unique_id(entry_id: str, legacy_unique_id: str) -> str:
     """Make entity identity stable across mutable MQTT network names."""
     return f"{entry_id}_{legacy_unique_id}"

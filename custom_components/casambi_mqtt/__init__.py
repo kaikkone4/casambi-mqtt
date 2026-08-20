@@ -17,15 +17,22 @@ from .const import (
     MQTT_TOPIC_PREFIX,
     configured_network_name,
     entry_scoped_unique_id,
+    switch_button_signal,
     switch_event_signal,
 )
 from .entities.entities import Scene, Unit
+from .event import async_add_switch_buttons
 from .light import CasambiMqttLight
 from .runtime_data import CasambiMqttRuntimeData
 from .scene import CasambiMqttScene
 from .switch_events import MAX_SWITCH_VALUE, decode_switch_event
 
-PLATFORMS: list[Platform] = [Platform.LIGHT, Platform.BUTTON, Platform.SCENE]
+PLATFORMS: list[Platform] = [
+    Platform.LIGHT,
+    Platform.BUTTON,
+    Platform.SCENE,
+    Platform.EVENT,
+]
 LEGACY_ADDRESSLESS_LIGHT_UNIQUE_ID = "casambi_mqtt_light_"
 CONFIG_ENTRY_VERSION = 2
 SWITCH_STORE_VERSION = 1
@@ -167,15 +174,38 @@ async def _async_process_switch_event(
             await runtime_data.switch_store.async_save(
                 runtime_data.stored_switch_buttons()
             )
+    async_add_switch_buttons(entry, unit_id)
+    async_dispatcher_send(
+        hass, switch_button_signal(entry.entry_id, unit_id, button), event_type
+    )
     async_dispatcher_send(
         hass, switch_event_signal(entry.entry_id, unit_id, button, event_type)
     )
 
 
+def _registered_switch_units(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Adopt every switch device the registry already holds for this entry."""
+    # The device registry is the durable record of which switches exist. The
+    # button store only ever held the extra buttons observed on top of the
+    # standard four, and it did not exist before 0.2.5 at all.
+    identifier_prefix = f"{entry.entry_id}:switch:"
+    for device in dr.async_entries_for_config_entry(dr.async_get(hass), entry.entry_id):
+        for domain, value in device.identifiers:
+            if domain != DOMAIN or not value.startswith(identifier_prefix):
+                continue
+            try:
+                unit_id = int(value[len(identifier_prefix) :])
+            except ValueError:
+                continue
+            if 0 <= unit_id <= MAX_SWITCH_VALUE:
+                entry.runtime_data.add_switch_unit(unit_id, device.id)
+
+
 def _restore_switch_buttons(
     hass: HomeAssistant, entry: ConfigEntry, stored_switches: object
 ) -> None:
-    """Restore valid observed buttons for devices still in the registry."""
+    """Restore observed buttons for switch devices still in the registry."""
+    _registered_switch_units(hass, entry)
     if not isinstance(stored_switches, dict):
         return
     registry = dr.async_get(hass)

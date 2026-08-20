@@ -26,6 +26,23 @@
       "network_name_in_use": "This MQTT network name is already configured"
     }
   },
+  "entity": {
+    "event": {
+      "button": {
+        "name": "Button {button}",
+        "state_attributes": {
+          "event_type": {
+            "state": {
+              "press": "Pressed",
+              "release": "Released",
+              "hold": "Held",
+              "release_after_hold": "Released after hold"
+            }
+          }
+        }
+      }
+    }
+  },
   "device_automation": {
     "trigger_type": {
       "press": "Button {subtype} pressed",
