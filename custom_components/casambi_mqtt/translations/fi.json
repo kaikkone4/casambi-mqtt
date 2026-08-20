@@ -26,6 +26,23 @@
       "network_name_in_use": "Tämä MQTT-verkon nimi on jo määritetty"
     }
   },
+  "entity": {
+    "event": {
+      "button": {
+        "name": "Painike {button}",
+        "state_attributes": {
+          "event_type": {
+            "state": {
+              "press": "Painettiin",
+              "release": "Vapautettiin",
+              "hold": "Pidettiin painettuna",
+              "release_after_hold": "Vapautettiin pitkän painalluksen jälkeen"
+            }
+          }
+        }
+      }
+    }
+  },
   "device_automation": {
     "trigger_type": {
       "press": "Painiketta {subtype} painettiin",

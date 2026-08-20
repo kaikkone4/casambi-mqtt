@@ -21,9 +21,11 @@ class CasambiMqttRuntimeData:
     network_name: str
     light_add_entities: AddEntitiesCallback | None = None
     scene_add_entities: AddEntitiesCallback | None = None
+    event_add_entities: AddEntitiesCallback | None = None
     lights: dict[str, CasambiMqttLight] = field(default_factory=dict)
     scenes: dict[str, CasambiMqttScene] = field(default_factory=dict)
     switch_units: dict[int, SwitchUnit] = field(default_factory=dict)
+    switch_button_events: set[tuple[int, int]] = field(default_factory=set)
     last_switch_events: dict[tuple[int, int, str], float] = field(default_factory=dict)
     switch_store: Store | None = None
 
