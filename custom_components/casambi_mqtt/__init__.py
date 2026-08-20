@@ -7,6 +7,7 @@ from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.dispatcher import async_dispatcher_send
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.typing import ConfigType
 
@@ -16,6 +17,7 @@ from .const import (
     MQTT_TOPIC_PREFIX,
     configured_network_name,
     entry_scoped_unique_id,
+    switch_event_signal,
 )
 from .entities.entities import Scene, Unit
 from .light import CasambiMqttLight
@@ -141,23 +143,33 @@ async def _async_process_switch_event(
     if runtime_data.is_duplicate_switch_event(event_key):
         return
 
-    switch_unit = runtime_data.switch_units.get(unit_id)
-    if switch_unit is None:
-        device = dr.async_get(hass).async_get_or_create(
+    registry = dr.async_get(hass)
+    identifiers = {(DOMAIN, f"{entry.entry_id}:switch:{unit_id}")}
+    # Resolve the device on every event: a runtime device id that no longer
+    # matches the registry would otherwise silently block trigger enumeration.
+    device = registry.async_get_device(identifiers=identifiers)
+    if device is None:
+        device = registry.async_get_or_create(
             config_entry_id=entry.entry_id,
-            identifiers={(DOMAIN, f"{entry.entry_id}:switch:{unit_id}")},
+            identifiers=identifiers,
             manufacturer="Casambi",
             model="Switch",
             name=f"Casambi switch {unit_id}",
         )
+    switch_unit = runtime_data.switch_units.get(unit_id)
+    if switch_unit is None:
         switch_unit = runtime_data.add_switch_unit(unit_id, device.id)
+    elif switch_unit.device_id != device.id:
+        switch_unit.device_id = device.id
     if button not in switch_unit.buttons:
         switch_unit.buttons.add(button)
         if runtime_data.switch_store is not None:
             await runtime_data.switch_store.async_save(
                 runtime_data.stored_switch_buttons()
             )
-    runtime_data.fire_switch_event(event_key)
+    async_dispatcher_send(
+        hass, switch_event_signal(entry.entry_id, unit_id, button, event_type)
+    )
 
 
 def _restore_switch_buttons(

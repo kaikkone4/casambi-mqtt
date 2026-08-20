@@ -5,8 +5,6 @@ from time import monotonic
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    from collections.abc import Callable
-
     from homeassistant.helpers.entity_platform import AddEntitiesCallback
     from homeassistant.helpers.storage import Store
 
@@ -26,9 +24,6 @@ class CasambiMqttRuntimeData:
     lights: dict[str, CasambiMqttLight] = field(default_factory=dict)
     scenes: dict[str, CasambiMqttScene] = field(default_factory=dict)
     switch_units: dict[int, SwitchUnit] = field(default_factory=dict)
-    switch_listeners: dict[tuple[int, int, str], list[Callable[[], None]]] = field(
-        default_factory=dict
-    )
     last_switch_events: dict[tuple[int, int, str], float] = field(default_factory=dict)
     switch_store: Store | None = None
 
@@ -44,11 +39,6 @@ class CasambiMqttRuntimeData:
         switch_unit = SwitchUnit(device_id=device_id)
         self.switch_units[unit_id] = switch_unit
         return switch_unit
-
-    def fire_switch_event(self, event_key: tuple[int, int, str]) -> None:
-        """Notify only matching private trigger listeners."""
-        for listener in tuple(self.switch_listeners.get(event_key, ())):
-            listener()
 
     def stored_switch_buttons(self) -> dict[str, list[int]]:
         """Return the minimal durable switch discovery state."""
