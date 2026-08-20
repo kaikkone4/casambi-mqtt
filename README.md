@@ -6,6 +6,12 @@ A local-push Home Assistant integration for Casambi networks. A separate Bluetoo
 
 ## Release notes
 
+### 0.2.6
+
+- Fixes device-trigger enumeration and reload persistence on Home Assistant 2026.8.2.
+- Known Casambi switches expose default buttons 1–4 plus any observed extra buttons.
+- Switch devices heal after Home Assistant device-registry removal and recreation.
+
 ### 0.2.5
 
 - Persists sanitized observed unit/button pairs across Home Assistant reloads so input-only device triggers remain available.
