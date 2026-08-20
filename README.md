@@ -6,6 +6,11 @@ A local-push Home Assistant integration for Casambi networks. A separate Bluetoo
 
 ## Release notes
 
+### 0.2.5
+
+- Persists sanitized observed unit/button pairs across Home Assistant reloads so input-only device triggers remain available.
+- A physical switch has device triggers, not conditions, actions, or control entities.
+
 ### 0.2.4
 
 - Bridge v0.2.3+ publishes sanitized physical switch events to MQTT.
