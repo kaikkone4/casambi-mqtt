@@ -3,6 +3,7 @@ import json
 import logging
 import os
 import sys
+import time
 from collections.abc import Awaitable
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
@@ -35,6 +36,7 @@ TOPIC_PREFIX = "casambi"
 MAX_BRIGHTNESS = 255
 SWITCH_PROBE_SECONDS = 90
 MAX_SWITCH_EVENT_VALUE = 255
+SWITCH_EVENT_DEDUP_SECONDS = 0.25
 SUPPORTED_SWITCH_EVENTS = frozenset({"PRESS", "RELEASE", "HOLD", "RELEASE_AFTER_HOLD"})
 
 load_dotenv()
@@ -57,8 +59,8 @@ LOGGER.addHandler(handler)
 background_tasks = set()
 
 
-def emit_switch_event(event: Any) -> None:
-    """Write only the supported semantic fields from a Casambi switch event."""
+def sanitize_switch_event(event: Any) -> dict[str, int | str] | None:
+    """Return the public semantic fields from a supported switch event."""
     try:
         event_type = event.event.name
         button = event.button
@@ -70,12 +72,60 @@ def emit_switch_event(event: Any) -> None:
             or not 0 <= button <= MAX_SWITCH_EVENT_VALUE
             or not 0 <= unit_id <= MAX_SWITCH_EVENT_VALUE
         ):
+            return None
+    except Exception:  # noqa: BLE001  # Never leak dependency/event details.
+        return None
+    else:
+        return {"unit_id": unit_id, "button": button, "event": event_type}
+
+
+def emit_switch_event(event: Any) -> None:
+    """Write only the supported semantic fields from a Casambi switch event."""
+    try:
+        record = sanitize_switch_event(event)
+        if record is None:
             return
-        record = {"event": event_type, "button": button, "unit_id": unit_id}
         sys.stdout.write(json.dumps(record, separators=(",", ":")) + "\n")
         sys.stdout.flush()
     except Exception:  # noqa: BLE001  # Never leak dependency/event details.
         return
+
+
+class SwitchEventPublisher:
+    """Publish sanitized switch events while collapsing callback bursts."""
+
+    def __init__(
+        self, client: aiomqtt.Client, *, monotonic: Any = time.monotonic
+    ) -> None:
+        self.client = client
+        self.monotonic = monotonic
+        self.last_seen: dict[tuple[int | str, int | str, int | str], float] = {}
+
+    async def publish(self, event: Any) -> None:
+        record = sanitize_switch_event(event)
+        if record is None:
+            return
+
+        key = (record["unit_id"], record["button"], record["event"])
+        now = self.monotonic()
+        previous = self.last_seen.get(key)
+        if previous is not None and now - previous < SWITCH_EVENT_DEDUP_SECONDS:
+            return
+        self.last_seen[key] = now
+
+        await log_exceptions(
+            self.client.publish(
+                f"{TOPIC_PREFIX}/{NETWORK_NAME}/switch_events",
+                payload=json.dumps(record, separators=(",", ":")),
+                qos=1,
+                retain=False,
+            )
+        )
+
+    def __call__(self, event: Any) -> None:
+        task = asyncio.create_task(self.publish(event))
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
 
 
 def configured_network_device(devices: list[Any]) -> Any | None:
@@ -380,6 +430,49 @@ async def process_command(
         LOGGER.warning("Unable to process Casambi command %s: %s", action, error)
 
 
+async def run_connected_bridge(casa: Casambi, client: aiomqtt.Client) -> None:
+    """Run one connected MQTT session with paired callback cleanup."""
+
+    def unit_callback(unit: CasambiBt.Unit) -> None:
+        if not unit.address and not addressless_unit_uuid_is_unique(casa, unit):
+            LOGGER.error("Skipping live addressless unit update with non-unique UUID")
+            return
+        task = asyncio.create_task(publish_unit(unit, client))
+        background_tasks.add(task)
+        task.add_done_callback(background_tasks.discard)
+
+    switch_callback = SwitchEventPublisher(client)
+    unit_registered = False
+    switch_registered = False
+    try:
+        await client.subscribe(f"{TOPIC_PREFIX}/{NETWORK_NAME}/commands")
+
+        # Publish the baseline before registering live updates. Casambi can emit
+        # an initial UnitChanged burst during registration; handling it in
+        # parallel would recreate the MQTT queue exhaustion this snapshot avoids.
+        await publish_entities(casa, client)
+        casa.registerUnitChangedHandler(unit_callback)
+        unit_registered = True
+        casa.registerSwitchEventHandler(switch_callback)
+        switch_registered = True
+
+        LOGGER.info("Subscribed to commands and registered Casambi event handlers")
+        async for message in client.messages:
+            LOGGER.debug(
+                "Received command: %s on topic: '%s'",
+                message.payload.decode(),
+                message.topic,
+            )
+            await process_command(message, casa, client)
+    finally:
+        try:
+            if switch_registered:
+                casa.unregisterSwitchEventHandler(switch_callback)
+        finally:
+            if unit_registered:
+                casa.unregisterUnitChangedHandler(unit_callback)
+
+
 async def main() -> None:
     if not is_valid_network_name(NETWORK_NAME):
         message = "CASAMBI_NETWORK_NAME must be one literal, non-empty MQTT topic level"
@@ -406,43 +499,14 @@ async def main() -> None:
         )
         interval = 5
 
-        def callback(unit: CasambiBt.Unit) -> None:
-            if not unit.address and not addressless_unit_uuid_is_unique(casa, unit):
-                LOGGER.error(
-                    "Skipping live addressless unit update with non-unique UUID"
-                )
-                return
-            task = asyncio.create_task(publish_unit(unit, client))
-            background_tasks.add(task)
-            task.add_done_callback(background_tasks.discard)
-
         while True:
             try:
                 async with client:
-                    await client.subscribe(f"{TOPIC_PREFIX}/{NETWORK_NAME}/commands")
-
-                    # Publish the baseline before registering live updates.
-                    # Casambi can emit a burst of initial UnitChanged callbacks
-                    # during registration; handling that burst concurrently would
-                    # recreate the MQTT queue exhaustion this snapshot avoids.
-                    await publish_entities(casa, client)
-                    casa.registerUnitChangedHandler(callback)
-
-                    LOGGER.info(
-                        "Subscribed to commands topic and UnitChangedHandler registered"
-                    )
-                    async for message in client.messages:
-                        LOGGER.debug(
-                            "Received command: %s on topic: '%s'",
-                            message.payload.decode(),
-                            message.topic,
-                        )
-                        await process_command(message, casa, client)
+                    await run_connected_bridge(casa, client)
             except aiomqtt.MqttError as e:
                 LOGGER.warning(
                     "Connection lost (%s); Reconnecting in %d seconds ...", e, interval
                 )
-                casa.unregisterUnitChangedHandler(callback)
                 await asyncio.sleep(interval)
             except asyncio.CancelledError:
                 LOGGER.info("Main task cancelled, waiting for cleanup")

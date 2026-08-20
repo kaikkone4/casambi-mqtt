@@ -52,6 +52,27 @@ For production, run the bridge under a service manager such as systemd and deplo
 
 The bridge logs available Casambi networks when it cannot find a configured network. It publishes state below `casambi/<network>/events/` and `casambi/<network>/scenes/`; commands are accepted at `casambi/<network>/commands`.
 
+### Switch event MQTT contract
+
+While the normal bridge has both Casambi and MQTT connected, it also translates
+supported `casambi-bt==0.3.2` switch callbacks to this event-only MQTT contract:
+
+- **Topic:** `casambi/<network>/switch_events`, where `<network>` is the same
+  validated `CASAMBI_NETWORK_NAME` topic level used by the existing bridge topics.
+- **Payload:** compact UTF-8 JSON with exactly `{"unit_id":<0-255>,"button":<0-255>,"event":"<type>"}`.
+  The supported event types are `PRESS`, `RELEASE`, `HOLD`, and
+  `RELEASE_AFTER_HOLD`; malformed and unknown callback values are dropped.
+- **Delivery:** QoS 1 with `retain=false`. Switch events are not state and are
+  never retained by the bridge.
+
+The bridge does not include a unit name, Bluetooth address, network identifier,
+raw callback payload, or credentials in this message. Identical sanitized
+`(unit_id, button, event)` callback bursts within 250 ms are collapsed using a
+monotonic clock. A `PRESS` and `RELEASE` are distinct tuples, so the real
+press/release sequence is preserved. The handler is unregistered whenever the
+MQTT session reconnects or the bridge shuts down. This topic does not control a
+device and does not create or trigger a Home Assistant entity, scene, or action.
+
 ### Bounded switch-event probe
 
 The bridge has an explicit 90-second, read-only diagnostic mode for switch
