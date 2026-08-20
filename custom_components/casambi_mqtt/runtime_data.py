@@ -8,6 +8,7 @@ if TYPE_CHECKING:
     from collections.abc import Callable
 
     from homeassistant.helpers.entity_platform import AddEntitiesCallback
+    from homeassistant.helpers.storage import Store
 
     from .light import CasambiMqttLight
     from .scene import CasambiMqttScene
@@ -29,6 +30,7 @@ class CasambiMqttRuntimeData:
         default_factory=dict
     )
     last_switch_events: dict[tuple[int, int, str], float] = field(default_factory=dict)
+    switch_store: Store | None = None
 
     def is_duplicate_switch_event(self, event_key: tuple[int, int, str]) -> bool:
         """Collapse an identical QoS retry burst, but not distinct event phases."""
@@ -47,6 +49,14 @@ class CasambiMqttRuntimeData:
         """Notify only matching private trigger listeners."""
         for listener in tuple(self.switch_listeners.get(event_key, ())):
             listener()
+
+    def stored_switch_buttons(self) -> dict[str, list[int]]:
+        """Return the minimal durable switch discovery state."""
+        return {
+            str(unit_id): sorted(switch_unit.buttons)
+            for unit_id, switch_unit in self.switch_units.items()
+            if switch_unit.buttons
+        }
 
 
 @dataclass

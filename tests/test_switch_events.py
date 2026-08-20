@@ -15,6 +15,11 @@ from homeassistant.helpers import device_registry as dr, entity_registry as er
 async def _setup_entry(hass, network_name="test"):
     entry = MockConfigEntry(domain=DOMAIN, data={CONF_NETWORK_NAME: network_name})
     entry.add_to_hass(hass)
+    subscriptions = await _setup_entry_again(hass, entry)
+    return entry, subscriptions
+
+
+async def _setup_entry_again(hass, entry):
     subscriptions = []
 
     async def subscribe(_hass, topic, callback, qos):
@@ -27,7 +32,7 @@ async def _setup_entry(hass, network_name="test"):
     ):
         assert await integration.async_setup_entry(hass, entry)
 
-    return entry, subscriptions
+    return subscriptions
 
 
 @pytest.mark.asyncio
@@ -226,6 +231,36 @@ async def test_trigger_attaches_after_reload_before_switch_is_rediscovered(hass)
         "subtype": 2,
         "description": "Casambi switch button 2 press",
     }
+
+
+@pytest.mark.asyncio
+async def test_observed_buttons_are_restored_for_trigger_enumeration(hass):
+    entry, subscriptions = await _setup_entry(hass)
+    await subscriptions[2][1](
+        SimpleNamespace(
+            topic="casambi/test/switch_events",
+            payload=json.dumps({"unit_id": 7, "button": 2, "event": "PRESS"}),
+        )
+    )
+    device_id = entry.runtime_data.switch_units[7].device_id
+
+    await _setup_entry_again(hass, entry)
+
+    assert await device_trigger.async_get_triggers(hass, device_id) == [
+        {
+            "platform": "device",
+            "domain": DOMAIN,
+            "device_id": device_id,
+            "type": event_type,
+            "subtype": 2,
+        }
+        for event_type in (
+            "press",
+            "release",
+            "hold",
+            "release_after_hold",
+        )
+    ]
 
 
 @pytest.mark.asyncio
