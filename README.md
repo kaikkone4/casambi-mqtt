@@ -4,6 +4,14 @@ A local-push Home Assistant integration for Casambi networks. A separate Bluetoo
 
 > This project uses the unofficial [casambi-bt](https://github.com/lkempf/casambi-bt) library. It currently supports dimmable lights and scenes.
 
+## Release notes
+
+### 0.2.3
+
+- The bridge now publishes sanitized switch callbacks to the bridge-only MQTT topic `casambi/<network>/switch_events` as `{"unit_id":<0-255>,"button":<0-255>,"event":"<type>"}`.
+- Events use QoS 1, are not retained, and identical `(unit_id, button, event)` callbacks are deduplicated within 250 ms.
+- This adds no Home Assistant automation integration or device-control path; consumers subscribe to the MQTT event topic directly.
+
 ## Architecture and requirements
 
 You need all of the following:
