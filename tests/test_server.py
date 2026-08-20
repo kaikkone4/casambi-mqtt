@@ -1,7 +1,9 @@
 import asyncio
 import importlib.util
+import json
 import sys
 import types
+from enum import Enum
 from pathlib import Path
 
 import pytest
@@ -82,6 +84,208 @@ def load_server_module():
 @pytest.fixture
 def server():
     return load_server_module()
+
+
+class SwitchEventType(Enum):
+    PRESS = 0x01
+    RELEASE = 0x02
+    HOLD = 0x09
+    RELEASE_AFTER_HOLD = 0x0C
+    UNKNOWN = 0xFFFF
+
+
+@pytest.mark.parametrize(
+    "event_type",
+    [
+        SwitchEventType.PRESS,
+        SwitchEventType.RELEASE,
+        SwitchEventType.HOLD,
+        SwitchEventType.RELEASE_AFTER_HOLD,
+    ],
+)
+def test_switch_probe_emits_supported_event_enum_button_and_unit_id(
+    server, event_type, capsys
+):
+    event = types.SimpleNamespace(
+        event=event_type,
+        button=2,
+        unit_id=7,
+        address="AA:BB:CC:DD:EE:FF",
+        network_id="private-network",
+        name="Kitchen",
+        extra_data=b"secret payload",
+    )
+
+    server.emit_switch_event(event)
+
+    assert json.loads(capsys.readouterr().out) == {
+        "event": event_type.name,
+        "button": 2,
+        "unit_id": 7,
+    }
+
+
+@pytest.mark.parametrize(
+    "event",
+    [
+        types.SimpleNamespace(
+            event=SwitchEventType.UNKNOWN, button=1, unit_id=2
+        ),
+        types.SimpleNamespace(
+            event=types.SimpleNamespace(name="PRIVATE_EVENT"), button=1, unit_id=2
+        ),
+        types.SimpleNamespace(event=SwitchEventType.PRESS, button=True, unit_id=2),
+        types.SimpleNamespace(event=SwitchEventType.PRESS, button=1, unit_id="2"),
+        object(),
+    ],
+)
+def test_switch_probe_drops_unknown_or_malformed_events(server, event, capsys):
+    server.emit_switch_event(event)
+
+    assert capsys.readouterr().out == ""
+
+
+@pytest.mark.asyncio
+async def test_switch_probe_uses_bridge_connection_and_90_second_handler_lifecycle(
+    server, monkeypatch
+):
+    calls = []
+    device = types.SimpleNamespace(address="configured-address")
+
+    async def discover():
+        calls.append("discover")
+        return [device]
+
+    class FakeCasambi:
+        async def connect(self, target, password):
+            assert target is device
+            assert password == "configured-password"
+            calls.append("connect")
+
+        def registerSwitchEventHandler(self, callback):
+            assert callback is server.emit_switch_event
+            calls.append("register")
+
+        def unregisterSwitchEventHandler(self, callback):
+            assert callback is server.emit_switch_event
+            calls.append("unregister")
+
+        async def disconnect(self):
+            calls.append("disconnect")
+
+    def casambi_factory():
+        calls.append("construct-default-cache")
+        return FakeCasambi()
+
+    async def sleep(seconds):
+        assert seconds == 90
+        calls.append("sleep")
+
+    monkeypatch.setattr(server, "NETWORK_ADDRESS", device.address)
+    monkeypatch.setattr(server, "NETWORK_PASSWORD", "configured-password")
+    monkeypatch.setattr(server, "discover", discover)
+    monkeypatch.setattr(server, "Casambi", casambi_factory)
+    monkeypatch.setattr(
+        server.aiomqtt,
+        "Client",
+        lambda *args, **kwargs: pytest.fail("probe must not construct an MQTT client"),
+    )
+
+    await server.run_switch_event_probe(sleep=sleep)
+
+    assert calls == [
+        "discover",
+        "construct-default-cache",
+        "connect",
+        "register",
+        "sleep",
+        "unregister",
+        "disconnect",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_switch_probe_unregisters_and_disconnects_when_listening_fails(
+    server, monkeypatch
+):
+    calls = []
+    device = types.SimpleNamespace(address="private-address")
+
+    class FakeCasambi:
+        async def connect(self, target, password):
+            calls.append("connect")
+
+        def registerSwitchEventHandler(self, callback):
+            calls.append("register")
+
+        def unregisterSwitchEventHandler(self, callback):
+            calls.append("unregister")
+
+        async def disconnect(self):
+            calls.append("disconnect")
+
+    async def discover():
+        return [device]
+
+    async def failing_sleep(seconds):
+        calls.append("sleep")
+        raise RuntimeError("private-address secret payload")
+
+    monkeypatch.setattr(server, "NETWORK_ADDRESS", device.address)
+    monkeypatch.setattr(server, "discover", discover)
+    monkeypatch.setattr(server, "Casambi", FakeCasambi)
+
+    with pytest.raises(RuntimeError):
+        await server.run_switch_event_probe(sleep=failing_sleep)
+
+    assert calls == ["connect", "register", "sleep", "unregister", "disconnect"]
+
+
+def test_switch_probe_cli_returns_only_fixed_sanitized_failure(
+    server, monkeypatch, capsys
+):
+    async def fail_with_sensitive_details():
+        raise RuntimeError("AA:BB:CC:DD:EE:FF Kitchen secret payload")
+
+    async def bridge_must_not_run():
+        pytest.fail("probe mode must not start the default bridge")
+
+    monkeypatch.setattr(server, "run_switch_event_probe", fail_with_sensitive_details)
+    monkeypatch.setattr(server, "main", bridge_must_not_run)
+
+    assert server.cli(["switch-event-probe"]) == 1
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "casambi switch probe: failed\n"
+    assert "AA:BB:CC:DD:EE:FF" not in captured.err
+    assert "Kitchen" not in captured.err
+    assert "secret payload" not in captured.err
+
+
+def test_cli_without_probe_mode_runs_default_bridge_unchanged(server, monkeypatch):
+    calls = []
+
+    async def bridge_main():
+        calls.append("bridge")
+
+    async def probe_must_not_run():
+        pytest.fail("default invocation must not start probe mode")
+
+    monkeypatch.setattr(server, "main", bridge_main)
+    monkeypatch.setattr(server, "run_switch_event_probe", probe_must_not_run)
+
+    assert server.cli([]) == 0
+    assert calls == ["bridge"]
+
+
+def test_shared_device_selection_preserves_default_bridge_last_match(server, monkeypatch):
+    first = types.SimpleNamespace(address="configured")
+    other = types.SimpleNamespace(address="other")
+    last = types.SimpleNamespace(address="configured")
+    monkeypatch.setattr(server, "NETWORK_ADDRESS", "configured")
+
+    assert server.configured_network_device([first, other, last]) is last
 
 
 class FakeUnitType:
