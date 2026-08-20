@@ -6,6 +6,10 @@ A local-push Home Assistant integration for Casambi networks. A separate Bluetoo
 
 ## Release notes
 
+### 0.2.7
+
+- Fixes the Home Assistant automation editor's **Kohteen mukaan** target-picker path by exposing each Casambi switch button as a read-only event entity; the device remains input-only, with no service, control entity, or actions.
+
 ### 0.2.6
 
 - Fixes device-trigger enumeration and reload persistence on Home Assistant 2026.8.2.
