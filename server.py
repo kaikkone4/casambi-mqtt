@@ -28,6 +28,7 @@ from custom_components.casambi_mqtt.entities.entities import (
     UnitState,
     UnitType,
 )
+from switch_decoder import install_switch_event_decoder
 
 if TYPE_CHECKING:
     from bleak import BLEDevice
@@ -91,6 +92,27 @@ def emit_switch_event(event: Any) -> None:
         return
 
 
+def switch_event_dedup_key(
+    event: Any, record: dict[str, int | str]
+) -> tuple[object, ...]:
+    """
+    Return the private in-process identity used to collapse duplicates.
+
+    The decoder knows, from the frame origin, which events are retransmissions
+    of one physical action and which are separate actions that happen to share
+    their public fields. Prefer that identity: two genuine presses of the same
+    button 100 ms apart look identical in the public payload, and deduplicating
+    on the payload alone would silently drop the second one.
+
+    Callbacks that did not come from the decoder have no such identity, so they
+    keep the original conservative behaviour of collapsing an identical burst.
+    """
+    identity = getattr(event, "dedup_identity", None)
+    if identity is not None:
+        return ("decoded", identity)
+    return ("callback", record["unit_id"], record["button"], record["event"])
+
+
 class SwitchEventPublisher:
     """Publish sanitized switch events while collapsing callback bursts."""
 
@@ -99,15 +121,30 @@ class SwitchEventPublisher:
     ) -> None:
         self.client = client
         self.monotonic = monotonic
-        self.last_seen: dict[tuple[int | str, int | str, int | str], float] = {}
+        self.last_seen: dict[tuple[object, ...], float] = {}
+
+    def _purge_expired(self, now: float) -> None:
+        """
+        Drop entries that can no longer suppress anything.
+
+        Decoded events are keyed by a per-action identity, so without this the
+        table would gain one permanent entry per physical press for as long as
+        the bridge runs. An entry older than the window already fails the check
+        below, so removing it changes no decision.
+        """
+        cutoff = now - SWITCH_EVENT_DEDUP_SECONDS
+        for key, seen_at in list(self.last_seen.items()):
+            if seen_at <= cutoff:
+                del self.last_seen[key]
 
     async def publish(self, event: Any) -> None:
         record = sanitize_switch_event(event)
         if record is None:
             return
 
-        key = (record["unit_id"], record["button"], record["event"])
         now = self.monotonic()
+        self._purge_expired(now)
+        key = switch_event_dedup_key(event, record)
         previous = self.last_seen.get(key)
         if previous is not None and now - previous < SWITCH_EVENT_DEDUP_SECONDS:
             return
@@ -139,6 +176,11 @@ def configured_network_device(devices: list[Any]) -> Any | None:
 
 def create_casambi_connection() -> Casambi:
     """Construct Casambi with the bridge's default cache-path semantics."""
+    # casambi-bt 0.3.2 misparses switch-event frames and reports every physical
+    # control as button 4. Correct that one parser here, at the single point
+    # both the bridge and the probe build a connection, before any packet can
+    # arrive. Every other casambi-bt path is left untouched.
+    install_switch_event_decoder()
     return Casambi()
 
 
