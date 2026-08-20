@@ -92,6 +92,27 @@ def emit_switch_event(event: Any) -> None:
         return
 
 
+def switch_event_dedup_key(
+    event: Any, record: dict[str, int | str]
+) -> tuple[object, ...]:
+    """
+    Return the private in-process identity used to collapse duplicates.
+
+    The decoder knows, from the frame origin, which events are retransmissions
+    of one physical action and which are separate actions that happen to share
+    their public fields. Prefer that identity: two genuine presses of the same
+    button 100 ms apart look identical in the public payload, and deduplicating
+    on the payload alone would silently drop the second one.
+
+    Callbacks that did not come from the decoder have no such identity, so they
+    keep the original conservative behaviour of collapsing an identical burst.
+    """
+    identity = getattr(event, "dedup_identity", None)
+    if identity is not None:
+        return ("decoded", identity)
+    return ("callback", record["unit_id"], record["button"], record["event"])
+
+
 class SwitchEventPublisher:
     """Publish sanitized switch events while collapsing callback bursts."""
 
@@ -100,14 +121,14 @@ class SwitchEventPublisher:
     ) -> None:
         self.client = client
         self.monotonic = monotonic
-        self.last_seen: dict[tuple[int | str, int | str, int | str], float] = {}
+        self.last_seen: dict[tuple[object, ...], float] = {}
 
     async def publish(self, event: Any) -> None:
         record = sanitize_switch_event(event)
         if record is None:
             return
 
-        key = (record["unit_id"], record["button"], record["event"])
+        key = switch_event_dedup_key(event, record)
         now = self.monotonic()
         previous = self.last_seen.get(key)
         if previous is not None and now - previous < SWITCH_EVENT_DEDUP_SECONDS:

@@ -310,9 +310,10 @@ def test_a_valid_frame_after_a_broken_one_is_still_lost_not_guessed():
 # 11. the public contract
 
 
-def test_decoded_event_exposes_only_contract_fields():
+def test_decoded_event_publishes_only_contract_fields():
+    server = _load_server()
     (event,) = decoder().decode(button_frame(0))
-    assert {f for f in vars(event)} == {"unit_id", "button", "event"}
+    assert set(server.sanitize_switch_event(event)) == {"unit_id", "button", "event"}
 
 
 def test_phase_names_match_the_published_event_vocabulary():
@@ -406,3 +407,212 @@ def test_sanitiser_still_rejects_anything_outside_the_contract():
         button = 1
 
     assert server.sanitize_switch_event(NotAnEvent()) is None
+
+
+# blocker 1: the publisher must not collapse genuinely distinct rapid actions
+
+import asyncio  # noqa: E402
+import json  # noqa: E402
+import logging  # noqa: E402
+
+
+def _publisher(server, times):
+    from test_server import RecordingMqttClient
+
+    client = RecordingMqttClient()
+    clock = iter(times)
+    return client, server.SwitchEventPublisher(client, monotonic=lambda: next(clock))
+
+
+def _published_events(client):
+    return [json.loads(kwargs["payload"])["event"] for _, kwargs in client.messages]
+
+
+@pytest.mark.asyncio
+async def test_rapid_press_release_press_all_reach_mqtt():
+    """Three distinct physical actions inside one 250 ms window."""
+    server = _load_server()
+    client, publisher = _publisher(server, [0.0, 0.1, 0.2])
+    dec = decoder()
+
+    events = []
+    events += dec.decode(button_frame(0, origin=0x2000))  # press
+    events += dec.decode(button_frame(0, origin=0x2002))  # release
+    events += dec.decode(button_frame(0, origin=0x2004))  # press again
+    assert [event.event.name for event in events] == ["PRESS", "RELEASE", "PRESS"]
+
+    for event in events:
+        await publisher.publish(event)
+
+    assert _published_events(client) == ["PRESS", "RELEASE", "PRESS"]
+
+
+@pytest.mark.asyncio
+async def test_repeated_rapid_presses_of_one_button_all_reach_mqtt():
+    server = _load_server()
+    client, publisher = _publisher(server, [0.0, 0.05, 0.1, 0.15])
+    dec = decoder()
+    for origin in (0x3000, 0x3004, 0x3008, 0x300C):
+        for event in dec.decode(button_frame(1, origin=origin)):
+            await publisher.publish(event)
+
+    assert _published_events(client) == ["PRESS"] * 4
+
+
+@pytest.mark.asyncio
+async def test_same_origin_retransmit_publishes_once():
+    """Both at the decoder and, defensively, at the publisher."""
+    server = _load_server()
+    client, publisher = _publisher(server, [0.0, 0.05, 0.1])
+    dec = decoder()
+    packet = button_frame(0, origin=0x4000) + input_frame(
+        0, SwitchEventPhase.PRESS.value, origin=0x4000
+    )
+
+    for event in dec.decode(packet):
+        await publisher.publish(event)
+    for event in dec.decode(packet):  # retransmit: decoder suppresses it
+        await publisher.publish(event)
+
+    assert _published_events(client) == ["PRESS"]
+
+
+@pytest.mark.asyncio
+async def test_publisher_suppresses_a_repeated_identity_on_its_own():
+    """Defence in depth: the same decoded action delivered twice."""
+    server = _load_server()
+    client, publisher = _publisher(server, [0.0, 0.05])
+    (event,) = decoder().decode(button_frame(0, origin=0x5000))
+
+    await publisher.publish(event)
+    await publisher.publish(event)
+
+    assert _published_events(client) == ["PRESS"]
+
+
+@pytest.mark.asyncio
+async def test_press_then_release_is_never_collapsed_end_to_end():
+    server = _load_server()
+    client, publisher = _publisher(server, [0.0, 0.01])
+    dec = decoder()
+    for event in dec.decode(button_frame(2, origin=0x6000)):
+        await publisher.publish(event)
+    for event in dec.decode(button_frame(2, origin=0x6002)):
+        await publisher.publish(event)
+
+    assert _published_events(client) == ["PRESS", "RELEASE"]
+
+
+@pytest.mark.asyncio
+async def test_legacy_callback_bursts_are_still_suppressed():
+    """Events that did not come from the decoder keep the old timer behaviour."""
+    server = _load_server()
+    from test_server import switch_event
+
+    client, publisher = _publisher(server, [10.0, 10.1, 10.2, 10.6])
+    await publisher.publish(switch_event())
+    await publisher.publish(switch_event())
+    await publisher.publish(switch_event(SwitchEventPhase.RELEASE))
+    await publisher.publish(switch_event())
+
+    assert _published_events(client) == ["PRESS", "RELEASE", "PRESS"]
+
+
+@pytest.mark.asyncio
+async def test_no_private_identity_escapes_to_mqtt_or_logs(caplog):
+    """The frame origin is in-process only. It must not leave the bridge."""
+    server = _load_server()
+    marker_origin = 0xBEEF & ~0x02
+    markers = (format(marker_origin, "x"), str(marker_origin), "dedup_identity")
+
+    with caplog.at_level(logging.DEBUG):
+        client, publisher = _publisher(server, [0.0])
+        (event,) = decoder().decode(button_frame(0, origin=marker_origin))
+        assert event.dedup_identity is not None
+        await publisher.publish(event)
+
+    (_topic, kwargs) = client.messages[0]
+    payload = kwargs["payload"]
+    assert json.loads(payload) == {"unit_id": UNIT_ID, "button": 1, "event": "PRESS"}
+    for text in (payload, repr(event), str(event), caplog.text):
+        for marker in markers:
+            assert marker.lower() not in text.lower()
+
+
+def test_probe_output_carries_no_private_identity(capsys):
+    server = _load_server()
+    (event,) = decoder().decode(button_frame(0, origin=0xBEEC))
+    server.emit_switch_event(event)
+    printed = capsys.readouterr().out
+    assert json.loads(printed) == {"unit_id": UNIT_ID, "button": 1, "event": "PRESS"}
+    assert "beec" not in printed.lower()
+
+
+# randomized parser safety
+
+
+def test_random_bytes_never_crash_or_produce_off_contract_events():
+    """Fuzz the parser: garbage must be dropped, never guessed at."""
+    import random
+
+    rng = random.Random(20260820)
+    server = _load_server()
+    for _ in range(2000):
+        data = bytes(rng.randrange(256) for _ in range(rng.randrange(0, 48)))
+        for event in decoder().decode(data):
+            record = server.sanitize_switch_event(event)
+            assert record is not None
+            assert set(record) == {"unit_id", "button", "event"}
+            assert 1 <= record["button"] <= 8
+            assert 0 <= record["unit_id"] <= 255
+            assert record["event"] in {
+                "PRESS",
+                "RELEASE",
+                "HOLD",
+                "RELEASE_AFTER_HOLD",
+            }
+
+
+# blocker 2: third-party licence material must ship and stay shipped
+
+THIRD_PARTY = ROOT / "THIRD_PARTY_LICENSES"
+APACHE_TEXT = THIRD_PARTY / "Apache-2.0-casambi-bt.txt"
+NOTICE = THIRD_PARTY / "NOTICE.md"
+
+
+def test_apache_licence_text_is_present_and_complete():
+    text = APACHE_TEXT.read_text(encoding="utf-8")
+    assert "Apache License" in text
+    assert "Version 2.0, January 2004" in text
+    assert "TERMS AND CONDITIONS FOR USE, REPRODUCTION, AND DISTRIBUTION" in text
+    assert "END OF TERMS AND CONDITIONS" in text
+    assert len(text) > 10000
+
+
+def test_notice_states_provenance_and_modifications():
+    notice = NOTICE.read_text(encoding="utf-8").lower()
+    assert "casambi-bt" in notice
+    assert "apache" in notice
+    assert "switch_decoder.py" in notice
+    assert "modif" in notice
+
+
+def test_repository_mit_licence_is_untouched():
+    assert "MIT License" in (ROOT / "LICENSE").read_text(encoding="utf-8")
+
+
+def test_docker_image_ships_the_decoder_and_licence_material():
+    """Guards against the artifact silently losing either one."""
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    assert "COPY switch_decoder.py ." in dockerfile
+    assert "COPY THIRD_PARTY_LICENSES/ THIRD_PARTY_LICENSES/" in dockerfile
+
+
+def test_licence_files_contain_no_local_or_sensitive_material():
+    for path in (APACHE_TEXT, NOTICE):
+        content = path.read_text(encoding="utf-8").lower()
+        for marker in ("password", "secret", "token", ".env", "192.168"):
+            assert marker not in content
+
+
+assert asyncio is not None  # imported for the async tests above

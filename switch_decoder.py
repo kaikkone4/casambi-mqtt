@@ -39,7 +39,7 @@ publishes, and unknown or truncated input yields no event at all rather than an
 from __future__ import annotations
 
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, unique
 from time import monotonic as _monotonic
 from typing import TYPE_CHECKING, Any, Final
@@ -115,15 +115,25 @@ class InvocationFrame:
 @dataclass(frozen=True)
 class SwitchEvent:
     """
-    Exactly the fields the bridge publishes, and nothing else.
+    What the bridge publishes, plus one private in-process identity.
 
-    Shaped to what casambi-mqtt already consumes from casambi-bt's callback:
-    ``unit_id``, ``button`` and ``event.name``.
+    ``unit_id``, ``button`` and ``event.name`` are what casambi-mqtt already
+    consumes from casambi-bt's callback and are the only fields that reach MQTT.
+
+    ``dedup_identity`` is derived from the frame origin and exists solely so the
+    publisher can tell a retransmission from a genuinely new physical action.
+    Two rapid presses of one button are indistinguishable by public fields
+    alone, so without it the publisher's timer would swallow the second. It is
+    kept out of ``repr`` and equality so it cannot leak into a log line, an
+    exception or a diagnostic, and nothing serialises it.
     """
 
     unit_id: int
     button: int
     event: SwitchEventPhase
+    dedup_identity: tuple[int, int, int] | None = field(
+        default=None, repr=False, compare=False
+    )
 
 
 def parse_invocation_stream(data: bytes) -> list[InvocationFrame]:
@@ -251,6 +261,7 @@ class SwitchEventDecoder:
             unit_id=frame.unit_id,
             button=control + 1,
             event=phase,
+            dedup_identity=(frame.unit_id, control, frame.origin),
         )
 
 
