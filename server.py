@@ -28,6 +28,7 @@ from custom_components.casambi_mqtt.entities.entities import (
     UnitState,
     UnitType,
 )
+from switch_decoder import install_switch_event_decoder
 
 if TYPE_CHECKING:
     from bleak import BLEDevice
@@ -139,6 +140,11 @@ def configured_network_device(devices: list[Any]) -> Any | None:
 
 def create_casambi_connection() -> Casambi:
     """Construct Casambi with the bridge's default cache-path semantics."""
+    # casambi-bt 0.3.2 misparses switch-event frames and reports every physical
+    # control as button 4. Correct that one parser here, at the single point
+    # both the bridge and the probe build a connection, before any packet can
+    # arrive. Every other casambi-bt path is left untouched.
+    install_switch_event_decoder()
     return Casambi()
 
 
