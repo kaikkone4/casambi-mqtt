@@ -6,6 +6,12 @@ A local-push Home Assistant integration for Casambi networks. A separate Bluetoo
 
 ## Release notes
 
+### 0.2.4
+
+- Bridge v0.2.3+ publishes sanitized physical switch events to MQTT.
+- HACS v0.2.4 subscribes to those events and discovers switch devices only after a physical event.
+- The Home Assistant device triggers are input-only; no control entity or action is added for Casambi switches.
+
 ### 0.2.3
 
 - The bridge now publishes sanitized switch callbacks to the bridge-only MQTT topic `casambi/<network>/switch_events` as `{"unit_id":<0-255>,"button":<0-255>,"event":"<type>"}`.
