@@ -52,6 +52,24 @@ For production, run the bridge under a service manager such as systemd and deplo
 
 The bridge logs available Casambi networks when it cannot find a configured network. It publishes state below `casambi/<network>/events/` and `casambi/<network>/scenes/`; commands are accepted at `casambi/<network>/commands`.
 
+### Bounded switch-event probe
+
+The bridge has an explicit 90-second, read-only diagnostic mode for switch
+events. Run it from the bridge's normal working directory **only while the
+service is stopped**:
+
+```bash
+sudo systemctl stop casambi-mqtt.service && ./.venv/bin/python server.py switch-event-probe
+```
+
+The mode loads the same `.env` variables and constructs the same
+`casambi-bt==0.3.2` `Casambi()` connection as the normal bridge. Consequently,
+when it is run from the service's working directory, it uses that deployment's
+existing `casambi-bt-store` cache/session. It does not start an MQTT client or
+invoke control, configuration, pairing, or reset operations. Each supported
+event is emitted as one JSON object containing only `event`, `button`, and
+`unit_id`; all failures use a fixed, non-diagnostic message.
+
 ### Addressless Casambi units
 
 Some Casambi units do not expose a usable Bluetooth address. For those units, the bridge uses their stable UUID only for MQTT and Home Assistant identity (`events/uuid/<uuid>`). The original Casambi address is retained in the control path. Do not manually create retained payloads on the legacy bare `events/` topic.

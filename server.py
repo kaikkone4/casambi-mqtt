@@ -33,6 +33,9 @@ if TYPE_CHECKING:
 
 TOPIC_PREFIX = "casambi"
 MAX_BRIGHTNESS = 255
+SWITCH_PROBE_SECONDS = 90
+MAX_SWITCH_EVENT_VALUE = 255
+SUPPORTED_SWITCH_EVENTS = frozenset({"PRESS", "RELEASE", "HOLD", "RELEASE_AFTER_HOLD"})
 
 load_dotenv()
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
@@ -52,6 +55,62 @@ handler.setFormatter(
 LOGGER.addHandler(handler)
 
 background_tasks = set()
+
+
+def emit_switch_event(event: Any) -> None:
+    """Write only the supported semantic fields from a Casambi switch event."""
+    try:
+        event_type = event.event.name
+        button = event.button
+        unit_id = event.unit_id
+        if (
+            event_type not in SUPPORTED_SWITCH_EVENTS
+            or type(button) is not int
+            or type(unit_id) is not int
+            or not 0 <= button <= MAX_SWITCH_EVENT_VALUE
+            or not 0 <= unit_id <= MAX_SWITCH_EVENT_VALUE
+        ):
+            return
+        record = {"event": event_type, "button": button, "unit_id": unit_id}
+        sys.stdout.write(json.dumps(record, separators=(",", ":")) + "\n")
+        sys.stdout.flush()
+    except Exception:  # noqa: BLE001  # Never leak dependency/event details.
+        return
+
+
+def configured_network_device(devices: list[Any]) -> Any | None:
+    """Select the bridge-configured network from discovery results."""
+    configured = None
+    for device in devices:
+        if device.address == NETWORK_ADDRESS:
+            configured = device
+    return configured
+
+
+def create_casambi_connection() -> Casambi:
+    """Construct Casambi with the bridge's default cache-path semantics."""
+    return Casambi()
+
+
+async def run_switch_event_probe(*, sleep: Any = asyncio.sleep) -> None:
+    """Connect with bridge settings and listen read-only for a bounded window."""
+    device = configured_network_device(await discover())
+    if device is None:
+        raise RuntimeError
+
+    casa = create_casambi_connection()
+    registered = False
+    try:
+        await casa.connect(device, NETWORK_PASSWORD)
+        casa.registerSwitchEventHandler(emit_switch_event)
+        registered = True
+        await sleep(SWITCH_PROBE_SECONDS)
+    finally:
+        try:
+            if registered:
+                casa.unregisterSwitchEventHandler(emit_switch_event)
+        finally:
+            await casa.disconnect()
 
 
 async def log_exceptions(awaitable: Awaitable[Any]) -> Any:
@@ -327,10 +386,7 @@ async def main() -> None:
         raise RuntimeError(message)
 
     devices = await discover()
-    device: BLEDevice | None = None
-    for d in devices:
-        if d.address == NETWORK_ADDRESS:
-            device = d
+    device: BLEDevice | None = configured_network_device(devices)
 
     if device is None:
         LOGGER.info(
@@ -341,7 +397,7 @@ async def main() -> None:
             LOGGER.info("[%d]\t%s", i, d.address)
         sys.exit(0)
 
-    casa = Casambi()
+    casa = create_casambi_connection()
     try:
         await casa.connect(device, NETWORK_PASSWORD)
         LOGGER.info("Connected to Casambi network")
@@ -397,5 +453,23 @@ async def main() -> None:
         await casa.disconnect()
 
 
+def cli(argv: list[str] | None = None) -> int:
+    """Run the unchanged bridge, or the explicit sanitized switch probe."""
+    args = sys.argv[1:] if argv is None else argv
+    if args != ["switch-event-probe"]:
+        asyncio.run(main())
+        return 0
+
+    logging.disable(logging.CRITICAL)
+    try:
+        asyncio.run(run_switch_event_probe())
+    except KeyboardInterrupt:
+        return 130
+    except Exception:  # noqa: BLE001  # Errors can contain private network details.
+        sys.stderr.write("casambi switch probe: failed\n")
+        return 1
+    return 0
+
+
 if __name__ == "__main__":
-    asyncio.run(main())
+    raise SystemExit(cli())
