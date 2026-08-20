@@ -94,6 +94,80 @@ class SwitchEventType(Enum):
     UNKNOWN = 0xFFFF
 
 
+def switch_event(event_type=SwitchEventType.PRESS, **overrides):
+    values = {
+        "event": event_type,
+        "button": 2,
+        "unit_id": 7,
+        "address": "AA:BB:CC:DD:EE:FF",
+        "network_id": "private-network",
+        "name": "Kitchen",
+        "extra_data": b"secret payload",
+    }
+    values.update(overrides)
+    return types.SimpleNamespace(**values)
+
+
+@pytest.mark.asyncio
+async def test_switch_event_publisher_uses_sanitized_non_retained_mqtt_contract(server):
+    client = RecordingMqttClient()
+    publisher = server.SwitchEventPublisher(client)
+
+    await publisher.publish(switch_event())
+
+    assert client.messages == [
+        (
+            "casambi/default/switch_events",
+            {
+                "payload": '{"unit_id":7,"button":2,"event":"PRESS"}',
+                "qos": 1,
+                "retain": False,
+            },
+        )
+    ]
+
+
+@pytest.mark.asyncio
+async def test_switch_event_publisher_drops_duplicate_bursts_but_keeps_release(server):
+    client = RecordingMqttClient()
+    times = iter([10.0, 10.1, 10.2, 10.6])
+    publisher = server.SwitchEventPublisher(client, monotonic=lambda: next(times))
+
+    await publisher.publish(switch_event())
+    await publisher.publish(switch_event())
+    await publisher.publish(switch_event(SwitchEventType.RELEASE))
+    await publisher.publish(switch_event())
+
+    assert [json.loads(kwargs["payload"])["event"] for _, kwargs in client.messages] == [
+        "PRESS",
+        "RELEASE",
+        "PRESS",
+    ]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "event",
+    [
+        types.SimpleNamespace(event=SwitchEventType.UNKNOWN, button=1, unit_id=2),
+        types.SimpleNamespace(
+            event=types.SimpleNamespace(name="PRIVATE_EVENT"), button=1, unit_id=2
+        ),
+        types.SimpleNamespace(event=SwitchEventType.PRESS, button=True, unit_id=2),
+        types.SimpleNamespace(event=SwitchEventType.PRESS, button=1, unit_id="2"),
+        object(),
+    ],
+)
+async def test_switch_event_publisher_drops_unknown_or_malformed_events(
+    server, event
+):
+    client = RecordingMqttClient()
+
+    await server.SwitchEventPublisher(client).publish(event)
+
+    assert client.messages == []
+
+
 @pytest.mark.parametrize(
     "event_type",
     [
@@ -346,6 +420,104 @@ class RecordingMqttClient:
         await asyncio.sleep(0)
         self.messages.append((topic, kwargs))
         self.in_flight -= 1
+
+
+class EmptyMessageStream:
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        raise StopAsyncIteration
+
+
+class FailingMessageStream(EmptyMessageStream):
+    async def __anext__(self):
+        raise RuntimeError("mqtt session lost")
+
+
+class BridgeMqttClient(RecordingMqttClient):
+    def __init__(self, stream=None):
+        super().__init__()
+        self.incoming_messages = stream or EmptyMessageStream()
+        self.subscriptions = []
+
+    @property
+    def messages(self):
+        return self.incoming_messages
+
+    @messages.setter
+    def messages(self, value):
+        self.published_messages = value
+
+    async def publish(self, topic, **kwargs):
+        self.published_messages.append((topic, kwargs))
+
+    async def subscribe(self, topic):
+        self.subscriptions.append(topic)
+
+
+class LifecycleCasa(FakeCasa):
+    def __init__(self):
+        super().__init__()
+        self.lifecycle = []
+
+    def registerUnitChangedHandler(self, callback):
+        self.lifecycle.append(("register-unit", callback))
+
+    def unregisterUnitChangedHandler(self, callback):
+        self.lifecycle.append(("unregister-unit", callback))
+
+    def registerSwitchEventHandler(self, callback):
+        self.lifecycle.append(("register-switch", callback))
+
+    def unregisterSwitchEventHandler(self, callback):
+        self.lifecycle.append(("unregister-switch", callback))
+
+
+@pytest.mark.asyncio
+async def test_connected_bridge_registers_and_cleans_up_both_callback_types(server):
+    casa = LifecycleCasa()
+    client = BridgeMqttClient()
+
+    await server.run_connected_bridge(casa, client)
+
+    assert client.subscriptions == ["casambi/default/commands"]
+    assert [entry[0] for entry in casa.lifecycle] == [
+        "register-unit",
+        "register-switch",
+        "unregister-switch",
+        "unregister-unit",
+    ]
+    assert casa.lifecycle[0][1] is casa.lifecycle[3][1]
+    assert casa.lifecycle[1][1] is casa.lifecycle[2][1]
+    assert isinstance(casa.lifecycle[1][1], server.SwitchEventPublisher)
+    assert [topic for topic, _ in client.published_messages] == [
+        "casambi/default/events/",
+        "casambi/default/events/unit-a",
+        "casambi/default/events/unit-b",
+        "casambi/default/scenes/1",
+        "casambi/default/scenes/2",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_connected_bridge_unregisters_before_reconnect_after_failure(server):
+    casa = LifecycleCasa()
+
+    with pytest.raises(RuntimeError, match="mqtt session lost"):
+        await server.run_connected_bridge(casa, BridgeMqttClient(FailingMessageStream()))
+    await server.run_connected_bridge(casa, BridgeMqttClient())
+
+    assert [entry[0] for entry in casa.lifecycle] == [
+        "register-unit",
+        "register-switch",
+        "unregister-switch",
+        "unregister-unit",
+        "register-unit",
+        "register-switch",
+        "unregister-switch",
+        "unregister-unit",
+    ]
 
 
 @pytest.mark.asyncio
