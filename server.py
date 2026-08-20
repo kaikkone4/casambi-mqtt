@@ -123,13 +123,28 @@ class SwitchEventPublisher:
         self.monotonic = monotonic
         self.last_seen: dict[tuple[object, ...], float] = {}
 
+    def _purge_expired(self, now: float) -> None:
+        """
+        Drop entries that can no longer suppress anything.
+
+        Decoded events are keyed by a per-action identity, so without this the
+        table would gain one permanent entry per physical press for as long as
+        the bridge runs. An entry older than the window already fails the check
+        below, so removing it changes no decision.
+        """
+        cutoff = now - SWITCH_EVENT_DEDUP_SECONDS
+        for key, seen_at in list(self.last_seen.items()):
+            if seen_at <= cutoff:
+                del self.last_seen[key]
+
     async def publish(self, event: Any) -> None:
         record = sanitize_switch_event(event)
         if record is None:
             return
 
-        key = switch_event_dedup_key(event, record)
         now = self.monotonic()
+        self._purge_expired(now)
+        key = switch_event_dedup_key(event, record)
         previous = self.last_seen.get(key)
         if previous is not None and now - previous < SWITCH_EVENT_DEDUP_SECONDS:
             return

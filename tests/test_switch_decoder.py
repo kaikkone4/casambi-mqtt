@@ -573,6 +573,107 @@ def test_random_bytes_never_crash_or_produce_off_contract_events():
             }
 
 
+# bounded dedup state
+
+
+@pytest.mark.asyncio
+async def test_publisher_dedup_state_stays_bounded_over_many_actions():
+    """A long-lived bridge must not accumulate one entry per physical action."""
+    server = _load_server()
+    from test_server import RecordingMqttClient
+
+    client = RecordingMqttClient()
+    clock = Clock()
+    publisher = server.SwitchEventPublisher(client, monotonic=clock)
+    dec = decoder(clock)
+
+    actions = 10_000
+    for step in range(actions):
+        clock.now = float(step)  # one second apart: nothing stays live
+        for event in dec.decode(button_frame(0, origin=(step * 4) & 0xFFFF)):
+            await publisher.publish(event)
+
+    assert len(client.messages) == actions
+    assert len(publisher.last_seen) == 1
+
+
+@pytest.mark.asyncio
+async def test_live_dedup_entries_still_suppress_retransmits():
+    server = _load_server()
+    from test_server import RecordingMqttClient
+
+    client = RecordingMqttClient()
+    clock = Clock()
+    publisher = server.SwitchEventPublisher(client, monotonic=clock)
+    (event,) = decoder(clock).decode(button_frame(0, origin=0x7000))
+
+    await publisher.publish(event)
+    clock.advance(0.05)
+    await publisher.publish(event)  # retransmit inside the window
+
+    assert _published_events(client) == ["PRESS"]
+    assert len(publisher.last_seen) == 1
+
+
+@pytest.mark.asyncio
+async def test_expired_entries_are_purged_not_merely_ignored():
+    server = _load_server()
+    from test_server import RecordingMqttClient
+
+    client = RecordingMqttClient()
+    clock = Clock()
+    publisher = server.SwitchEventPublisher(client, monotonic=clock)
+    dec = decoder(clock)
+
+    for step, origin in enumerate((0x8000, 0x8004, 0x8008)):
+        clock.now = float(step)
+        for event in dec.decode(button_frame(0, origin=origin)):
+            await publisher.publish(event)
+        assert len(publisher.last_seen) == 1
+
+    assert _published_events(client) == ["PRESS", "PRESS", "PRESS"]
+
+
+@pytest.mark.asyncio
+async def test_legacy_dedup_state_is_bounded_too():
+    server = _load_server()
+    from test_server import RecordingMqttClient, switch_event
+
+    client = RecordingMqttClient()
+    clock = Clock()
+    publisher = server.SwitchEventPublisher(client, monotonic=clock)
+
+    for step in range(500):
+        clock.now = float(step)
+        await publisher.publish(switch_event(button=step % 8))
+
+    assert len(publisher.last_seen) == 1
+
+
+@pytest.mark.asyncio
+async def test_bounded_state_never_collapses_a_press_release_pair():
+    """Purging must not weaken the sequence guarantee."""
+    server = _load_server()
+    from test_server import RecordingMqttClient
+
+    client = RecordingMqttClient()
+    clock = Clock()
+    publisher = server.SwitchEventPublisher(client, monotonic=clock)
+    dec = decoder(clock)
+
+    for step in range(50):
+        clock.now = float(step)
+        base = 0x9000 + step * 8
+        for event in dec.decode(button_frame(1, origin=base)):
+            await publisher.publish(event)
+        clock.advance(0.02)
+        for event in dec.decode(button_frame(1, origin=base | 0x02)):
+            await publisher.publish(event)
+
+    assert _published_events(client) == ["PRESS", "RELEASE"] * 50
+    assert len(publisher.last_seen) <= 2
+
+
 # blocker 2: third-party licence material must ship and stay shipped
 
 THIRD_PARTY = ROOT / "THIRD_PARTY_LICENSES"
