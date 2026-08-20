@@ -54,4 +54,4 @@ jobs:
         - name: "Run Home Assistant component tests"
           run: |
             python3 -m pip install -r requirements-test.txt
-            pytest -q tests/test_light.py tests/test_integration.py tests/test_migration.py -o asyncio_mode=auto
+            pytest -q tests/test_light.py tests/test_integration.py tests/test_migration.py tests/test_switch_events.py -o asyncio_mode=auto
