@@ -1,9 +1,11 @@
+from functools import partial
 from urllib.parse import quote
 
 from homeassistant.components.mqtt import ReceiveMessage, async_subscribe
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.helpers.typing import ConfigType
 
@@ -18,6 +20,7 @@ from .entities.entities import Scene, Unit
 from .light import CasambiMqttLight
 from .runtime_data import CasambiMqttRuntimeData
 from .scene import CasambiMqttScene
+from .switch_events import decode_switch_event
 
 PLATFORMS: list[Platform] = [Platform.LIGHT, Platform.BUTTON, Platform.SCENE]
 LEGACY_ADDRESSLESS_LIGHT_UNIQUE_ID = "casambi_mqtt_light_"
@@ -118,6 +121,38 @@ async def async_migrate_entry(  # noqa: PLR0911
     return True
 
 
+async def _async_process_switch_event(
+    hass: HomeAssistant,
+    entry: ConfigEntry,
+    switch_event_topic: str,
+    msg: ReceiveMessage,
+) -> None:
+    """Consume one sanitized event without exposing its MQTT envelope."""
+    if msg.topic != switch_event_topic or getattr(msg, "retain", False):
+        return
+    switch_event = decode_switch_event(msg.payload)
+    if switch_event is None:
+        return
+    unit_id, button, event_type = switch_event
+    runtime_data: CasambiMqttRuntimeData = entry.runtime_data
+    event_key = (unit_id, button, event_type)
+    if runtime_data.is_duplicate_switch_event(event_key):
+        return
+
+    switch_unit = runtime_data.switch_units.get(unit_id)
+    if switch_unit is None:
+        device = dr.async_get(hass).async_get_or_create(
+            config_entry_id=entry.entry_id,
+            identifiers={(DOMAIN, f"{entry.entry_id}:switch:{unit_id}")},
+            manufacturer="Casambi",
+            model="Switch",
+            name=f"Casambi switch {unit_id}",
+        )
+        switch_unit = runtime_data.add_switch_unit(unit_id, device.id)
+    switch_unit.buttons.add(button)
+    runtime_data.fire_switch_event(event_key)
+
+
 async def async_setup_entry(  # noqa: PLR0915
     hass: HomeAssistant, entry: ConfigEntry
 ) -> bool:
@@ -128,6 +163,7 @@ async def async_setup_entry(  # noqa: PLR0915
 
     event_prefix = f"{MQTT_TOPIC_PREFIX}/{network_name}/events/"
     scene_prefix = f"{MQTT_TOPIC_PREFIX}/{network_name}/scenes/"
+    switch_event_topic = f"{MQTT_TOPIC_PREFIX}/{network_name}/switch_events"
 
     async def event_processor(  # noqa: PLR0911, PLR0912
         msg: ReceiveMessage,
@@ -232,6 +268,14 @@ async def async_setup_entry(  # noqa: PLR0915
         )
         unsubscribers.append(
             await async_subscribe(hass, f"{scene_prefix}#", scene_processor, 1)
+        )
+        unsubscribers.append(
+            await async_subscribe(
+                hass,
+                switch_event_topic,
+                partial(_async_process_switch_event, hass, entry, switch_event_topic),
+                1,
+            )
         )
     except Exception:
         for unsubscribe in unsubscribers:

@@ -1,0 +1,37 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "data": {
+          "mqtt_network_name": "MQTT-verkon nimi"
+        }
+      }
+    },
+    "error": {
+      "invalid_network_name": "Anna yksi MQTT-aihetaso ilman merkkejä /, +, # tai null",
+      "network_name_in_use": "Tämä MQTT-verkon nimi on jo määritetty"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "description": "{restart_note}",
+        "data": {
+          "mqtt_network_name": "MQTT-verkon nimi"
+        }
+      }
+    },
+    "error": {
+      "invalid_network_name": "Anna yksi MQTT-aihetaso ilman merkkejä /, +, # tai null",
+      "network_name_in_use": "Tämä MQTT-verkon nimi on jo määritetty"
+    }
+  },
+  "device_automation": {
+    "trigger_type": {
+      "press": "Painiketta {subtype} painettiin",
+      "release": "Painike {subtype} vapautettiin",
+      "hold": "Painiketta {subtype} pidettiin painettuna",
+      "release_after_hold": "Painike {subtype} vapautettiin pitkän painalluksen jälkeen"
+    }
+  }
+}
