@@ -7,6 +7,7 @@ from homeassistant.const import Platform
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
+from homeassistant.helpers.storage import Store
 from homeassistant.helpers.typing import ConfigType
 
 from .const import (
@@ -20,11 +21,12 @@ from .entities.entities import Scene, Unit
 from .light import CasambiMqttLight
 from .runtime_data import CasambiMqttRuntimeData
 from .scene import CasambiMqttScene
-from .switch_events import decode_switch_event
+from .switch_events import MAX_SWITCH_VALUE, decode_switch_event
 
 PLATFORMS: list[Platform] = [Platform.LIGHT, Platform.BUTTON, Platform.SCENE]
 LEGACY_ADDRESSLESS_LIGHT_UNIQUE_ID = "casambi_mqtt_light_"
 CONFIG_ENTRY_VERSION = 2
+SWITCH_STORE_VERSION = 1
 
 
 async def async_setup(hass: HomeAssistant, config: ConfigType) -> bool:
@@ -149,8 +151,45 @@ async def _async_process_switch_event(
             name=f"Casambi switch {unit_id}",
         )
         switch_unit = runtime_data.add_switch_unit(unit_id, device.id)
-    switch_unit.buttons.add(button)
+    if button not in switch_unit.buttons:
+        switch_unit.buttons.add(button)
+        if runtime_data.switch_store is not None:
+            await runtime_data.switch_store.async_save(
+                runtime_data.stored_switch_buttons()
+            )
     runtime_data.fire_switch_event(event_key)
+
+
+def _restore_switch_buttons(
+    hass: HomeAssistant, entry: ConfigEntry, stored_switches: object
+) -> None:
+    """Restore valid observed buttons for devices still in the registry."""
+    if not isinstance(stored_switches, dict):
+        return
+    registry = dr.async_get(hass)
+    for raw_unit_id, raw_buttons in stored_switches.items():
+        try:
+            unit_id = int(raw_unit_id)
+        except (TypeError, ValueError):
+            continue
+        if (
+            not 0 <= unit_id <= MAX_SWITCH_VALUE
+            or not isinstance(raw_buttons, list)
+            or not all(
+                isinstance(button, int)
+                and not isinstance(button, bool)
+                and 0 <= button <= MAX_SWITCH_VALUE
+                for button in raw_buttons
+            )
+        ):
+            continue
+        device = registry.async_get_device(
+            identifiers={(DOMAIN, f"{entry.entry_id}:switch:{unit_id}")}
+        )
+        if device is None:
+            continue
+        switch_unit = entry.runtime_data.add_switch_unit(unit_id, device.id)
+        switch_unit.buttons.update(raw_buttons)
 
 
 async def async_setup_entry(  # noqa: PLR0915
@@ -158,6 +197,11 @@ async def async_setup_entry(  # noqa: PLR0915
 ) -> bool:
     network_name = configured_network_name(entry.options, entry.data)
     entry.runtime_data = CasambiMqttRuntimeData(network_name=network_name)
+    switch_store = Store(
+        hass, SWITCH_STORE_VERSION, f"{DOMAIN}.{entry.entry_id}.switch_buttons"
+    )
+    entry.runtime_data.switch_store = switch_store
+    _restore_switch_buttons(hass, entry, await switch_store.async_load())
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     _remove_legacy_addressless_light(hass, entry)
 
