@@ -29,6 +29,7 @@ if TYPE_CHECKING:
 REQUIRED_DISTRIBUTION = "casambi-bt-revamped"
 REQUIRED_VERSION = "0.4.2.dev6"
 LISTEN_SECONDS = 90
+ADDRESS_HEX_LENGTH = 12
 MAX_EVENT_NUMBER = 255
 ALLOWED_EVENTS = frozenset(
     {
@@ -108,13 +109,25 @@ async def listen(
             await casa.disconnect()
 
 
+def normalize_address(address: str) -> str:
+    """Return a colon-delimited uppercase Casambi network address."""
+    compact = address.translate(str.maketrans("", "", ":-."))
+    if len(compact) != ADDRESS_HEX_LENGTH or not all(
+        character in "0123456789abcdefABCDEF" for character in compact
+    ):
+        raise ProbeError
+    return ":".join(
+        compact[index : index + 2] for index in range(0, ADDRESS_HEX_LENGTH, 2)
+    ).upper()
+
+
 async def resolve_target(
     address: str | None,
     discover: Callable[[], Awaitable[list[Any]]],
 ) -> Any:
     """Use the supplied address or a single unambiguous discovered endpoint."""
     if address is not None:
-        return address
+        return normalize_address(address)
     devices = await discover()
     if len(devices) != 1:
         raise ProbeError
