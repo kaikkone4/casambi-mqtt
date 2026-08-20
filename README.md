@@ -6,6 +6,12 @@ A local-push Home Assistant integration for Casambi networks. A separate Bluetoo
 
 ## Release notes
 
+### 0.2.8
+
+- Fixes PTM/Casambi switch-event invocation frame decoding while retaining `casambi-bt==0.3.2` and the public sanitized MQTT contract.
+- Button identities remain numeric and unlabeled pending physical validation; existing automation bound to the prior erroneous button 4 may require reassignment after that validation, without any mapping being assumed here.
+- Switch events remain input-only: the bridge adds no event control path.
+
 ### 0.2.7
 
 - Fixes the Home Assistant automation editor's **Kohteen mukaan** target-picker path by exposing each Casambi switch button as a read-only event entity; the device remains input-only, with no service, control entity, or actions.
