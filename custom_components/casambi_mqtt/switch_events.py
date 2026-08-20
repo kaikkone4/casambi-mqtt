@@ -5,6 +5,10 @@ from __future__ import annotations
 import json
 
 MAX_SWITCH_VALUE = 255
+# Casambi switch units do not announce their button count, so a switch that
+# Home Assistant has not heard from yet still offers the vendor's standard
+# four buttons. Any other button number is added once it is observed.
+DEFAULT_SWITCH_BUTTONS = (1, 2, 3, 4)
 SUPPORTED_SWITCH_EVENTS = (
     "PRESS",
     "RELEASE",

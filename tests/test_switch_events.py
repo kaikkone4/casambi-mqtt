@@ -8,8 +8,24 @@ from pytest_homeassistant_custom_component.common import MockConfigEntry
 import custom_components.casambi_mqtt as integration
 from custom_components.casambi_mqtt import device_trigger
 from custom_components.casambi_mqtt.const import CONF_NETWORK_NAME, DOMAIN
+from custom_components.casambi_mqtt.switch_events import DEFAULT_SWITCH_BUTTONS
 from homeassistant.components.device_automation import InvalidDeviceAutomationConfig
 from homeassistant.helpers import device_registry as dr, entity_registry as er
+
+
+def _expected_triggers(device_id, observed_buttons):
+    """The standard buttons plus whatever else has actually been observed."""
+    return [
+        {
+            "platform": "device",
+            "domain": DOMAIN,
+            "device_id": device_id,
+            "type": event_type,
+            "subtype": button,
+        }
+        for button in sorted({*DEFAULT_SWITCH_BUTTONS, *observed_buttons})
+        for event_type in ("press", "release", "hold", "release_after_hold")
+    ]
 
 
 async def _setup_entry(hass, network_name="test"):
@@ -49,7 +65,7 @@ async def test_valid_switch_event_discovers_device_and_triggers(hass):
     await subscriptions[2][1](
         SimpleNamespace(
             topic="casambi/test/switch_events",
-            payload=json.dumps({"unit_id": 7, "button": 2, "event": "PRESS"}),
+            payload=json.dumps({"unit_id": 7, "button": 9, "event": "PRESS"}),
         )
     )
 
@@ -61,21 +77,9 @@ async def test_valid_switch_event_discovers_device_and_triggers(hass):
     assert device.model == "Switch"
     assert er.async_entries_for_config_entry(er.async_get(hass), entry.entry_id) == []
 
-    assert await device_trigger.async_get_triggers(hass, device.id) == [
-        {
-            "platform": "device",
-            "domain": DOMAIN,
-            "device_id": device.id,
-            "type": event_type,
-            "subtype": 2,
-        }
-        for event_type in (
-            "press",
-            "release",
-            "hold",
-            "release_after_hold",
-        )
-    ]
+    assert await device_trigger.async_get_triggers(hass, device.id) == _expected_triggers(
+        device.id, {9}
+    )
 
 
 @pytest.mark.asyncio
@@ -239,28 +243,17 @@ async def test_observed_buttons_are_restored_for_trigger_enumeration(hass):
     await subscriptions[2][1](
         SimpleNamespace(
             topic="casambi/test/switch_events",
-            payload=json.dumps({"unit_id": 7, "button": 2, "event": "PRESS"}),
+            payload=json.dumps({"unit_id": 7, "button": 9, "event": "PRESS"}),
         )
     )
     device_id = entry.runtime_data.switch_units[7].device_id
 
     await _setup_entry_again(hass, entry)
 
-    assert await device_trigger.async_get_triggers(hass, device_id) == [
-        {
-            "platform": "device",
-            "domain": DOMAIN,
-            "device_id": device_id,
-            "type": event_type,
-            "subtype": 2,
-        }
-        for event_type in (
-            "press",
-            "release",
-            "hold",
-            "release_after_hold",
-        )
-    ]
+    assert entry.runtime_data.switch_units[7].buttons == {9}
+    assert await device_trigger.async_get_triggers(hass, device_id) == _expected_triggers(
+        device_id, {9}
+    )
 
 
 @pytest.mark.asyncio

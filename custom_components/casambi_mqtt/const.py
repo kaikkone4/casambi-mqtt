@@ -22,6 +22,15 @@ def configured_network_name(options: Mapping[str, Any], data: Mapping[str, Any])
     )
 
 
+def switch_event_signal(
+    entry_id: str, unit_id: int, button: int, event_type: str
+) -> str:
+    """Name the in-process signal for one switch event phase."""
+    # Dispatcher signals never reach the event bus, so device triggers stay
+    # private while surviving a config-entry reload.
+    return f"{DOMAIN}_{entry_id}_switch_{unit_id}_{button}_{event_type}"
+
+
 def entry_scoped_unique_id(entry_id: str, legacy_unique_id: str) -> str:
     """Make entity identity stable across mutable MQTT network names."""
     return f"{entry_id}_{legacy_unique_id}"
