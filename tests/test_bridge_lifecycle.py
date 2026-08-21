@@ -643,9 +643,26 @@ async def test_unit_publisher_stays_bounded_during_slow_broker_ack(server):
         loop.set_exception_handler(previous_handler)
 
 
+def _yielding_fake_sleep(calls):
+    """
+    A fake sleep() that records its argument but never really delays.
+
+    Awaiting it still does a genuine (instant) asyncio.sleep(0), so the
+    caller cooperatively yields exactly once per call instead of looping
+    synchronously forever -- real timing never enters the picture, so
+    these tests are deterministic on a slow or loaded CI runner too.
+    """
+
+    async def fake_sleep(seconds):
+        calls.append(seconds)
+        await asyncio.sleep(0)
+
+    return fake_sleep
+
+
 @pytest.mark.asyncio
 async def test_unit_publisher_survives_publish_failures_and_worker_keeps_going(
-    server, caplog, monkeypatch
+    server, caplog
 ):
     """
     Both failure kinds (aiomqtt.MqttError and a generic exception) must be
@@ -654,8 +671,8 @@ async def test_unit_publisher_survives_publish_failures_and_worker_keeps_going(
     clears, proving the retry path is genuinely self-healing rather than
     just "logged and dropped".
     """
-    monkeypatch.setattr(server, "PUBLISH_RETRY_SECONDS", 0.01)
     caplog.set_level(logging.WARNING)
+    sleep_calls = []
 
     class FlakyOnceClient:
         """Each named failure topic fails exactly once, then succeeds."""
@@ -676,7 +693,9 @@ async def test_unit_publisher_survives_publish_failures_and_worker_keeps_going(
 
     client = FlakyOnceClient()
     diagnostics = server.BridgeDiagnostics()
-    publisher = server.UnitStatePublisher(client, diagnostics=diagnostics)
+    publisher = server.UnitStatePublisher(
+        client, diagnostics=diagnostics, sleep=_yielding_fake_sleep(sleep_calls)
+    )
     await publisher.start()
 
     publisher.submit(make_unit("unit-mqtt-fail"))
@@ -688,7 +707,7 @@ async def test_unit_publisher_survives_publish_failures_and_worker_keeps_going(
 
     publisher.submit(make_unit("unit-runtime-fail"))
     publisher.submit(make_unit("unit-ok"))
-    await wait_until(lambda: len(client.calls) == 3, attempts=5000)
+    await wait_until(lambda: len(client.calls) == 3)
 
     assert publisher.failed >= 2
     assert sorted(topic for topic, _ in client.calls) == sorted(
@@ -698,12 +717,14 @@ async def test_unit_publisher_survives_publish_failures_and_worker_keeps_going(
             server.unit_event_topic(make_unit("unit-ok")),
         ]
     )
-    await publisher.aclose(drain_timeout=0.5)
+    assert all(seconds == server.PUBLISH_RETRY_SECONDS for seconds in sleep_calls)
+
+    await publisher.aclose(drain_timeout=0.2)
 
 
 @pytest.mark.asyncio
 async def test_unit_publisher_requeues_failed_publish_without_losing_newest_state(
-    server, monkeypatch
+    server,
 ):
     """
     Regression for blocker 3: publish_unit's suppress_errors=False path lets
@@ -711,7 +732,6 @@ async def test_unit_publisher_requeues_failed_publish_without_losing_newest_stat
     than lose it -- but a fresher value submitted while the failed publish
     was still in flight must survive untouched by the stale requeue.
     """
-    monkeypatch.setattr(server, "PUBLISH_RETRY_SECONDS", 0.01)
 
     class FlakyThenOkClient:
         def __init__(self):
@@ -730,7 +750,9 @@ async def test_unit_publisher_requeues_failed_publish_without_losing_newest_stat
 
     client = FlakyThenOkClient()
     diagnostics = server.BridgeDiagnostics()
-    publisher = server.UnitStatePublisher(client, diagnostics=diagnostics)
+    publisher = server.UnitStatePublisher(
+        client, diagnostics=diagnostics, sleep=_yielding_fake_sleep([])
+    )
     client.publisher = publisher
     await publisher.start()
 
@@ -745,20 +767,23 @@ async def test_unit_publisher_requeues_failed_publish_without_losing_newest_stat
     pending_unit = next(iter(publisher._pending.values()))  # noqa: SLF001
     assert pending_unit.state.dimmer == 99
 
-    await wait_until(lambda: len(client.calls) == 1, attempts=3000)
+    await wait_until(lambda: len(client.calls) == 1)
     payload = json.loads(client.calls[0][1]["payload"])
     assert payload["state"]["dimmer"] == 99
     assert diagnostics.unit_publish_confirmed == 1
 
-    await publisher.aclose(drain_timeout=0.5)
+    await publisher.aclose(drain_timeout=0.2)
 
 
 @pytest.mark.asyncio
-async def test_unit_publisher_backs_off_instead_of_spinning_on_dead_broker(
-    server, monkeypatch
-):
-    """A dead broker must produce at most one publish attempt per second."""
-    monkeypatch.setattr(server, "PUBLISH_RETRY_SECONDS", 0.05)
+async def test_unit_publisher_backs_off_between_every_failed_attempt(server):
+    """
+    A dead broker must never spin: every failed attempt is followed by
+    exactly one backoff sleep of PUBLISH_RETRY_SECONDS before the next is
+    tried. Deterministic -- proven by counting sleep calls against publish
+    attempts (they must always match 1:1), not by racing wall-clock time.
+    """
+    sleep_calls = []
 
     class AlwaysFailingClient:
         def __init__(self):
@@ -769,19 +794,15 @@ async def test_unit_publisher_backs_off_instead_of_spinning_on_dead_broker(
             raise aiomqtt.MqttError("dead broker")
 
     client = AlwaysFailingClient()
-    publisher = server.UnitStatePublisher(client)
+    publisher = server.UnitStatePublisher(client, sleep=_yielding_fake_sleep(sleep_calls))
     await publisher.start()
 
     publisher.submit(make_unit("unit-a"))
-    publisher.submit(make_unit("unit-b"))
 
-    await wait_until(lambda: client.attempts >= 1)
-    # Give the worker a bounded window in which, absent the backoff, it
-    # would have spun through both (and re-retried) many times over.
-    await asyncio.sleep(0.12)
-    # At 0.05s backoff and ~0.12s elapsed, at most a handful of attempts
-    # are possible -- nowhere near a tight spin loop.
-    assert client.attempts <= 5
+    await wait_until(lambda: len(sleep_calls) >= 5)
+
+    assert client.attempts == len(sleep_calls)
+    assert all(seconds == server.PUBLISH_RETRY_SECONDS for seconds in sleep_calls)
 
     await publisher.aclose(drain_timeout=0.2)
 

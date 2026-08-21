@@ -542,11 +542,16 @@ class UnitStatePublisher:
     """
 
     def __init__(
-        self, client: aiomqtt.Client, diagnostics: BridgeDiagnostics | None = None
+        self,
+        client: aiomqtt.Client,
+        diagnostics: BridgeDiagnostics | None = None,
+        *,
+        sleep: Any = asyncio.sleep,
     ) -> None:
         self.client = client
         self.diagnostics = diagnostics
         self.failed = 0
+        self._sleep = sleep
         self._pending: dict[str, CasambiBt.Unit] = {}
         self._wakeup = asyncio.Event()
         self._idle = asyncio.Event()
@@ -603,7 +608,7 @@ class UnitStatePublisher:
                         self._pending[topic] = unit
                     if self.diagnostics is not None:
                         self.diagnostics.unit_queue_depth = len(self._pending)
-                    await asyncio.sleep(PUBLISH_RETRY_SECONDS)
+                    await self._sleep(PUBLISH_RETRY_SECONDS)
                     # Stop draining this cycle rather than immediately
                     # trying the next pending topic: if the broker is dead,
                     # every remaining item would fail too, and without this
