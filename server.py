@@ -12,6 +12,7 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
 import aiomqtt
+import aiomqtt.client
 import CasambiBt
 from CasambiBt import Casambi, discover
 from dotenv import load_dotenv
@@ -97,6 +98,12 @@ class RedactingFilter(logging.Filter):
         record.exc_text = None
         record.stack_info = None
         message = record.getMessage()
+        # CasambiBt/_network.py logs an HTTP error body on a continuation
+        # line after the status code (f"Update failed: {code}\n{res.text}").
+        # That body is arbitrary cloud-API JSON/text -- ordinary letters
+        # survive the allowlist below, so a first-line-only cut is the one
+        # thing that reliably keeps it out regardless of what it contains.
+        message = message.split("\n", 1)[0]
         message = self._BYTES_LITERAL.sub("", message)
         message = self._MAC_LIKE.sub("", message)
         message = self._HEX_RUN.sub("", message)
@@ -111,6 +118,18 @@ def configure_logging() -> None:
     """
     Route third-party loggers through the bridge's handler without a root handler.
 
+    aiomqtt.Client, constructed without an explicit ``logger=`` kwarg (as the
+    bridge does), defaults to ``aiomqtt.client.MQTT_LOGGER`` --
+    ``logging.getLogger("mqtt")``. There is no logger literally named
+    "aiomqtt" anywhere in the dependency chain. aiomqtt's own
+    ``Client.__init__`` also calls ``self._client.enable_logger(logger)``
+    with that same object, so paho-mqtt shares it: paho's WARNING/ERROR
+    sites carry no topics or payloads (audited: the only one is an
+    unrecognised-command byte), so it is safe to leave unfiltered -- but at
+    DEBUG paho logs the full topic and byte count for every publish, which
+    is exactly why this logger's level is pinned to WARNING rather than left
+    at its default.
+
     CasambiBt logs from many per-module loggers (``CasambiBt._client``,
     ``CasambiBt._casambi``, ...), all children of ``CasambiBt`` that
     propagate up to it. A filter attached to the ``CasambiBt`` logger itself
@@ -119,29 +138,38 @@ def configure_logging() -> None:
     checks a *handler's* filters while walking the hierarchy, not every
     ancestor logger's filters. So the redaction filter has to live on a
     handler, and it must be a handler dedicated to CasambiBt: the handler
-    shared with ``aiomqtt`` and ``__main__`` must stay unfiltered for those,
-    so the filter cannot live on that shared handler either. Hence CasambiBt
-    gets its own ``StreamHandler`` (same format as the bridge's own).
+    shared with the mqtt logger and ``__main__`` must stay unfiltered for
+    those, so the filter cannot live on that shared handler either. Hence
+    CasambiBt gets its own ``StreamHandler`` (same format as the bridge's
+    own).
 
     Idempotent so ``cli()`` can call it unconditionally; no root handler and
-    no ``logging.basicConfig()`` -- everything outside these three loggers
-    keeps Python's default behaviour untouched.
+    no ``logging.basicConfig()`` -- everything outside these loggers keeps
+    Python's default behaviour untouched. The idempotency guard is a
+    dedicated flag rather than "does CasambiBt already have a handler",
+    since anything else attaching a handler to CasambiBt first would
+    otherwise trip that check and silently skip configuring the mqtt logger
+    too.
     """
-    casambi_logger = logging.getLogger("CasambiBt")
-    if casambi_logger.handlers:
+    if configure_logging.configured:
         return
+    configure_logging.configured = True
 
-    aiomqtt_logger = logging.getLogger("aiomqtt")
-    aiomqtt_logger.setLevel(logging.WARNING)
-    aiomqtt_logger.propagate = False
-    aiomqtt_logger.addHandler(handler)
+    mqtt_logger = aiomqtt.client.MQTT_LOGGER
+    mqtt_logger.setLevel(logging.WARNING)
+    mqtt_logger.propagate = False
+    mqtt_logger.addHandler(handler)
 
+    casambi_logger = logging.getLogger("CasambiBt")
     casambi_handler = logging.StreamHandler()
     casambi_handler.setFormatter(handler.formatter)
     casambi_handler.addFilter(RedactingFilter())
     casambi_logger.setLevel(logging.WARNING)
     casambi_logger.propagate = False
     casambi_logger.addHandler(casambi_handler)
+
+
+configure_logging.configured = False
 
 
 @dataclass
@@ -836,7 +864,10 @@ async def _cleanup_connected_bridge(
     """Reverse registration/startup order: newest-registered unwinds first."""
     if handles.heartbeat_task is not None:
         handles.heartbeat_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
+        # Suppress any exception, not just CancelledError: a heartbeat
+        # failure must never mask the original failure propagating out of
+        # this cleanup (which can be a CasambiDisconnected).
+        with contextlib.suppress(Exception, asyncio.CancelledError):
             await handles.heartbeat_task
     try:
         if handles.disconnect_registered:

@@ -7,6 +7,7 @@ import types
 from enum import Enum
 from pathlib import Path
 
+import aiomqtt.client
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -98,19 +99,23 @@ def _clean_third_party_loggers():
     the first test that exercises cli()'s bridge path would leave those
     loggers permanently reconfigured for the rest of the pytest session,
     including for tests/test_bridge_lifecycle.py's own configure_logging()
-    tests. Also resets logging.disable(): the switch-event-probe CLI path
-    calls logging.disable(logging.CRITICAL) as a probe-mode privacy measure
-    and never re-enables it (fine in production, where the process exits
-    right after); in a shared test process that would permanently silence
-    every logger for the rest of the session unless undone here.
+    tests. Snapshots/restores the *actual* logger aiomqtt routes through --
+    aiomqtt.client.MQTT_LOGGER, named "mqtt" -- not a logger merely named
+    "aiomqtt"; paho shares this same logger via Client.enable_logger(), so
+    this also covers paho's records. Also resets logging.disable(): the
+    switch-event-probe CLI path calls logging.disable(logging.CRITICAL) as a
+    probe-mode privacy measure and never re-enables it (fine in production,
+    where the process exits right after); in a shared test process that
+    would permanently silence every logger for the rest of the session
+    unless undone here.
     """
     logging.disable(logging.NOTSET)
-    aiomqtt_logger = logging.getLogger("aiomqtt")
+    mqtt_logger = aiomqtt.client.MQTT_LOGGER
     casambi_logger = logging.getLogger("CasambiBt")
     saved = {
-        "aiomqtt_handlers": list(aiomqtt_logger.handlers),
-        "aiomqtt_level": aiomqtt_logger.level,
-        "aiomqtt_propagate": aiomqtt_logger.propagate,
+        "mqtt_handlers": list(mqtt_logger.handlers),
+        "mqtt_level": mqtt_logger.level,
+        "mqtt_propagate": mqtt_logger.propagate,
         "casambi_handlers": list(casambi_logger.handlers),
         "casambi_filters": list(casambi_logger.filters),
         "casambi_level": casambi_logger.level,
@@ -118,9 +123,9 @@ def _clean_third_party_loggers():
     }
     yield
     logging.disable(logging.NOTSET)
-    aiomqtt_logger.handlers = saved["aiomqtt_handlers"]
-    aiomqtt_logger.level = saved["aiomqtt_level"]
-    aiomqtt_logger.propagate = saved["aiomqtt_propagate"]
+    mqtt_logger.handlers = saved["mqtt_handlers"]
+    mqtt_logger.level = saved["mqtt_level"]
+    mqtt_logger.propagate = saved["mqtt_propagate"]
     casambi_logger.handlers = saved["casambi_handlers"]
     casambi_logger.filters = saved["casambi_filters"]
     casambi_logger.level = saved["casambi_level"]

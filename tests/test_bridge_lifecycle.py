@@ -17,6 +17,7 @@ import types
 from pathlib import Path
 
 import aiomqtt
+import aiomqtt.client
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -99,6 +100,12 @@ def _clean_third_party_loggers():
     """
     Prevent one test's configure_logging() from polluting another's.
 
+    Snapshots/restores the *actual* logger aiomqtt routes through --
+    aiomqtt.client.MQTT_LOGGER, named "mqtt" -- not a logger merely named
+    "aiomqtt" (nothing in the dependency chain ever logs to that name).
+    Paho shares this same "mqtt" logger via Client.enable_logger(), so this
+    also covers paho's records.
+
     Also resets logging.disable(): the switch-event-probe CLI path
     (pre-existing, unrelated to this hardening work) calls
     logging.disable(logging.CRITICAL) as a probe-mode privacy measure and
@@ -107,12 +114,12 @@ def _clean_third_party_loggers():
     rest of the session unless undone here.
     """
     logging.disable(logging.NOTSET)
-    aiomqtt_logger = logging.getLogger("aiomqtt")
+    mqtt_logger = aiomqtt.client.MQTT_LOGGER
     casambi_logger = logging.getLogger("CasambiBt")
     saved = {
-        "aiomqtt_handlers": list(aiomqtt_logger.handlers),
-        "aiomqtt_level": aiomqtt_logger.level,
-        "aiomqtt_propagate": aiomqtt_logger.propagate,
+        "mqtt_handlers": list(mqtt_logger.handlers),
+        "mqtt_level": mqtt_logger.level,
+        "mqtt_propagate": mqtt_logger.propagate,
         "casambi_handlers": list(casambi_logger.handlers),
         "casambi_filters": list(casambi_logger.filters),
         "casambi_level": casambi_logger.level,
@@ -120,9 +127,9 @@ def _clean_third_party_loggers():
     }
     yield
     logging.disable(logging.NOTSET)
-    aiomqtt_logger.handlers = saved["aiomqtt_handlers"]
-    aiomqtt_logger.level = saved["aiomqtt_level"]
-    aiomqtt_logger.propagate = saved["aiomqtt_propagate"]
+    mqtt_logger.handlers = saved["mqtt_handlers"]
+    mqtt_logger.level = saved["mqtt_level"]
+    mqtt_logger.propagate = saved["mqtt_propagate"]
     casambi_logger.handlers = saved["casambi_handlers"]
     casambi_logger.filters = saved["casambi_filters"]
     casambi_logger.level = saved["casambi_level"]
@@ -284,8 +291,6 @@ async def wait_for_registration(casa, *, attribute="_disconnect_cb"):
 # ---------------------------------------------------------------------------
 
 
-def test_configure_logging_redacts_casambi_bt_hex_and_digits(server):
-    server.configure_logging()
 class _Capture(logging.Handler):
     """
     A handler appended *after* configure_logging(), on the same logger.
@@ -347,17 +352,82 @@ def test_configure_logging_drops_traceback_and_redacts_address(server):
     assert "boom" not in output
 
 
-def test_configure_logging_passes_aiomqtt_warnings_through_unredacted(server):
+def test_configure_logging_redacts_continuation_lines_entirely(server):
+    """
+    CasambiBt/_network.py:228 logs
+    f"Update failed: {res.status_code}\n{res.text}" -- an HTTP error body
+    from the Casambi cloud on its own line after the status code. The
+    character allowlist alone keeps ordinary letters, so an error body like
+    {"error":"invalid session","network":"<name>"} would survive redaction
+    as plain words, leaking a network name. Only the first line is kept.
+    """
     server.configure_logging()
     capture = _Capture()
-    logging.getLogger("aiomqtt").addHandler(capture)
+    logging.getLogger("CasambiBt").addHandler(capture)
     try:
-        logging.getLogger("aiomqtt").warning("There are %d pending publish calls.", 48)
+        logging.getLogger("CasambiBt._network").error(
+            "Update failed: 502\n"
+            '{"error":"invalid session","network":"Villa Meridian Estate"}'
+        )
     finally:
-        logging.getLogger("aiomqtt").removeHandler(capture)
+        logging.getLogger("CasambiBt").removeHandler(capture)
+    output = "\n".join(capture.lines)
+    assert "Villa Meridian Estate" not in output
+    assert "Villa" not in output
+    assert "Meridian" not in output
+
+
+def test_configure_logging_routes_the_real_mqtt_logger_aiomqtt_uses(server):
+    """
+    aiomqtt.Client, constructed without an explicit logger= kwarg (as the
+    bridge does), defaults to aiomqtt.client.MQTT_LOGGER --
+    logging.getLogger("mqtt"), not a logger literally named "aiomqtt". Assert
+    identity against the real object so a future aiomqtt rename fails this
+    test instead of silently regressing back to "nothing routes anywhere".
+    """
+    server.configure_logging()
+    assert aiomqtt.client.MQTT_LOGGER.handlers == [server.handler]
+    assert aiomqtt.client.MQTT_LOGGER.propagate is False
+
+
+def test_configure_logging_routes_pending_publish_warning_unredacted(server):
+    server.configure_logging()
+    capture = _Capture()
+    aiomqtt.client.MQTT_LOGGER.addHandler(capture)
+    try:
+        aiomqtt.client.MQTT_LOGGER.warning(
+            "There are %d pending publish calls.", 48
+        )
+    finally:
+        aiomqtt.client.MQTT_LOGGER.removeHandler(capture)
     output = "\n".join(capture.lines)
     assert "48" in output
-    assert "[aiomqtt]" in output
+    assert "[mqtt]" in output
+
+
+def test_configure_logging_suppresses_paho_debug_topic_logging(server):
+    """
+    aiomqtt.Client.__init__ calls self._client.enable_logger(logger) with
+    that same MQTT_LOGGER, so paho shares it. Paho's own WARNING/ERROR sites
+    carry no topics or payloads (audited: only an unrecognised-command byte),
+    so the logger is safe to leave unfiltered -- but at DEBUG, paho logs the
+    full topic and byte count for every publish
+    ("Sending PUBLISH ... '%s' ... (%d bytes)"). The WARNING level
+    configure_logging() sets is what keeps that out; this is a regression
+    test for that level, using a topic-shaped payload so it would actually
+    catch the level being loosened.
+    """
+    server.configure_logging()
+    capture = _Capture()
+    aiomqtt.client.MQTT_LOGGER.addHandler(capture)
+    try:
+        aiomqtt.client.MQTT_LOGGER.debug(
+            "Sending PUBLISH (d0, q1, r0, m4), "
+            "'casambi/default/events/AA:BB:CC:DD:EE:FF', ... (12 bytes)"
+        )
+    finally:
+        aiomqtt.client.MQTT_LOGGER.removeHandler(capture)
+    assert capture.lines == []
 
 
 def test_configure_logging_suppresses_casambi_bt_info_and_debug(server):
@@ -381,6 +451,25 @@ def test_configure_logging_is_idempotent(server):
     after_second = list(logging.getLogger("CasambiBt").handlers)
     assert len(after_first) == len(before) + 1
     assert after_second == after_first
+
+
+def test_configure_logging_still_routes_mqtt_logger_if_casambi_bt_already_has_a_handler(
+    server,
+):
+    """
+    Regression for guarding idempotency on casambi_logger.handlers being
+    non-empty: if anything else ever attaches a handler to "CasambiBt"
+    first, that guard would trip and the mqtt/paho logger would silently
+    never get configured. The guard must be independent of that logger's
+    handler list.
+    """
+    foreign = logging.NullHandler()
+    logging.getLogger("CasambiBt").addHandler(foreign)
+    try:
+        server.configure_logging()
+    finally:
+        logging.getLogger("CasambiBt").removeHandler(foreign)
+    assert aiomqtt.client.MQTT_LOGGER.handlers == [server.handler]
 
 
 # ---------------------------------------------------------------------------
