@@ -1,11 +1,13 @@
 import asyncio
 import importlib.util
 import json
+import logging
 import sys
 import types
 from enum import Enum
 from pathlib import Path
 
+import aiomqtt.client
 import pytest
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -84,6 +86,50 @@ def load_server_module():
 @pytest.fixture
 def server():
     return load_server_module()
+
+
+@pytest.fixture(autouse=True)
+def _clean_third_party_loggers():
+    """
+    Undo configure_logging()'s global effects between tests.
+
+    cli() calls configure_logging() unconditionally, and it mutates the
+    process-wide "aiomqtt"/"CasambiBt" loggers (handlers, level, propagate)
+    rather than anything scoped to one server module instance. Left alone,
+    the first test that exercises cli()'s bridge path would leave those
+    loggers permanently reconfigured for the rest of the pytest session,
+    including for tests/test_bridge_lifecycle.py's own configure_logging()
+    tests. Snapshots/restores the *actual* logger aiomqtt routes through --
+    aiomqtt.client.MQTT_LOGGER, named "mqtt" -- not a logger merely named
+    "aiomqtt"; paho shares this same logger via Client.enable_logger(), so
+    this also covers paho's records. Also resets logging.disable(): the
+    switch-event-probe CLI path calls logging.disable(logging.CRITICAL) as a
+    probe-mode privacy measure and never re-enables it (fine in production,
+    where the process exits right after); in a shared test process that
+    would permanently silence every logger for the rest of the session
+    unless undone here.
+    """
+    logging.disable(logging.NOTSET)
+    mqtt_logger = aiomqtt.client.MQTT_LOGGER
+    casambi_logger = logging.getLogger("CasambiBt")
+    saved = {
+        "mqtt_handlers": list(mqtt_logger.handlers),
+        "mqtt_level": mqtt_logger.level,
+        "mqtt_propagate": mqtt_logger.propagate,
+        "casambi_handlers": list(casambi_logger.handlers),
+        "casambi_filters": list(casambi_logger.filters),
+        "casambi_level": casambi_logger.level,
+        "casambi_propagate": casambi_logger.propagate,
+    }
+    yield
+    logging.disable(logging.NOTSET)
+    mqtt_logger.handlers = saved["mqtt_handlers"]
+    mqtt_logger.level = saved["mqtt_level"]
+    mqtt_logger.propagate = saved["mqtt_propagate"]
+    casambi_logger.handlers = saved["casambi_handlers"]
+    casambi_logger.filters = saved["casambi_filters"]
+    casambi_logger.level = saved["casambi_level"]
+    casambi_logger.propagate = saved["casambi_propagate"]
 
 
 class SwitchEventType(Enum):
@@ -473,13 +519,22 @@ class LifecycleCasa(FakeCasa):
     def unregisterSwitchEventHandler(self, callback):
         self.lifecycle.append(("unregister-switch", callback))
 
+    def registerDisconnectCallback(self, callback):
+        self.lifecycle.append(("register-disconnect", callback))
+
+    def unregisterDisconnectCallback(self, callback):
+        self.lifecycle.append(("unregister-disconnect", callback))
+
 
 @pytest.mark.asyncio
 async def test_connected_bridge_registers_and_cleans_up_both_callback_types(server):
     casa = LifecycleCasa()
     client = BridgeMqttClient()
 
-    await server.run_connected_bridge(casa, client)
+    # The BLE disconnect callback is registered once, by main(), for the
+    # whole process lifetime -- not here. run_connected_bridge only races
+    # the session against an already-existing event.
+    await server.run_connected_bridge(casa, client, asyncio.Event())
 
     assert client.subscriptions == ["casambi/default/commands"]
     assert [entry[0] for entry in casa.lifecycle] == [
@@ -501,12 +556,17 @@ async def test_connected_bridge_registers_and_cleans_up_both_callback_types(serv
 
 
 @pytest.mark.asyncio
-async def test_connected_bridge_unregisters_before_reconnect_after_failure(server):
+async def test_connected_bridge_unregisters_before_reconnect_after_failure(
+    server, caplog
+):
     casa = LifecycleCasa()
+    caplog.set_level("WARNING")
 
     with pytest.raises(RuntimeError, match="mqtt session lost"):
-        await server.run_connected_bridge(casa, BridgeMqttClient(FailingMessageStream()))
-    await server.run_connected_bridge(casa, BridgeMqttClient())
+        await server.run_connected_bridge(
+            casa, BridgeMqttClient(FailingMessageStream()), asyncio.Event()
+        )
+    await server.run_connected_bridge(casa, BridgeMqttClient(), asyncio.Event())
 
     assert [entry[0] for entry in casa.lifecycle] == [
         "register-unit",
@@ -518,6 +578,10 @@ async def test_connected_bridge_unregisters_before_reconnect_after_failure(serve
         "unregister-switch",
         "unregister-unit",
     ]
+    # An MQTT session failure is not a BLE disconnect: the sentinel warning
+    # must not fire, and CasambiDisconnected must not be raised here (the
+    # original RuntimeError above is what propagates).
+    assert "BLE connection lost" not in caplog.text
 
 
 @pytest.mark.asyncio
