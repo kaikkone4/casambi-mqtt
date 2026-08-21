@@ -49,6 +49,7 @@ SWITCH_EVENT_QUEUE_MAX = 64
 HEARTBEAT_SECONDS = 5
 LOOP_LAG_WARN_SECONDS = 1.0
 DIAGNOSTICS_INTERVAL_SECONDS = 300
+PUBLISH_RETRY_SECONDS = 1.0
 REDACTED_MESSAGE_MAX_LENGTH = 160
 
 load_dotenv()
@@ -183,6 +184,7 @@ class BridgeDiagnostics:
     """
 
     unit_callbacks: int = 0
+    commands_received: int = 0
     unit_queue_depth: int = 0
     unit_queue_peak: int = 0
     unit_publish_attempted: int = 0
@@ -480,15 +482,28 @@ def unit_event_topic(unit: CasambiBt.Unit) -> str | None:
     return f"{TOPIC_PREFIX}/{NETWORK_NAME}/events/uuid/{quote(unit_uuid, safe='')}"
 
 
-async def publish_unit(unit: CasambiBt.Unit, client: aiomqtt.Client) -> bool:
-    """Publish one retained unit state using the same topic for all paths."""
+async def publish_unit(
+    unit: CasambiBt.Unit, client: aiomqtt.Client, *, suppress_errors: bool = True
+) -> bool:
+    """
+    Publish one retained unit state using the same topic for all paths.
+
+    ``suppress_errors`` preserves publish_entities' existing behaviour
+    byte-for-byte (swallow aiomqtt.MqttError via log_exceptions, still
+    return True). UnitStatePublisher's worker needs the opposite: it calls
+    this with suppress_errors=False so a broker-level failure actually
+    reaches it and can be counted and retried instead of silently counted
+    as a success.
+    """
     topic = unit_event_topic(unit)
     if topic is None:
         return False
     entity = to_entity(unit)
-    await log_exceptions(
-        client.publish(topic, payload=entity.to_json(), qos=1, retain=True)
-    )
+    publish_call = client.publish(topic, payload=entity.to_json(), qos=1, retain=True)
+    if suppress_errors:
+        await log_exceptions(publish_call)
+    else:
+        await publish_call
     return True
 
 
@@ -502,6 +517,28 @@ class UnitStatePublisher:
     memory is bounded by the number of units in the network, not by the event
     rate. This loses nothing observable: retained state means only the newest
     value is ever the correct one to have published anyway.
+
+    Fairness: drained FIFO (oldest-submitted topic first). ``submit``
+    coalescing assigns to an existing dict key in place, which does not
+    change that key's iteration position -- so a unit re-submitted while
+    still pending updates its value without jumping the queue ahead of a
+    cold, already-pending, distinct unit. The one deliberate exception is
+    the retry path below: a topic that just failed to publish is requeued
+    at the BACK, not the front, so one broker hiccup cannot keep
+    reappearing ahead of everything else either.
+
+    Retry policy: a publish failure (aiomqtt.MqttError or otherwise) is
+    counted truthfully as failed, never as confirmed, and the unit's state
+    is requeued rather than lost -- but only if no newer value for that
+    same topic arrived while the publish was in flight (checked via
+    ``topic not in self._pending``); newest-wins must still hold, so a
+    fresher value already waiting must never be overwritten by the stale
+    one that just failed. After a requeue the worker stops draining for
+    this cycle and sleeps PUBLISH_RETRY_SECONDS before resuming, so a dead
+    broker produces at most one publish attempt per second instead of a
+    spin loop. This is self-healing beyond that: a broken MQTT session also
+    fails the command task, which tears the whole session down and
+    republishes the full baseline on reconnect.
     """
 
     def __init__(
@@ -540,23 +577,51 @@ class UnitStatePublisher:
             await self._wakeup.wait()
             self._wakeup.clear()
             while self._pending:
-                _topic, unit = self._pending.popitem()
+                # FIFO: oldest-submitted topic first (see class docstring
+                # for why -- LIFO here would let a hot, repeatedly
+                # re-submitted unit starve a cold, already-pending one).
+                topic = next(iter(self._pending))
+                unit = self._pending.pop(topic)
                 if self.diagnostics is not None:
                     self.diagnostics.unit_queue_depth = len(self._pending)
                     self.diagnostics.unit_publish_attempted += 1
                 try:
-                    await publish_unit(unit, self.client)
+                    await publish_unit(unit, self.client, suppress_errors=False)
                 except Exception:  # noqa: BLE001  # Never let one publish kill the worker.
                     self.failed += 1
                     if self.diagnostics is not None:
                         self.diagnostics.unit_publish_failed += 1
                     LOGGER.warning(
-                        "Unit state publish failed; will retry on next update"
+                        "Unit state publish failed; retrying after a backoff"
                     )
+                    # Requeue at the back -- the one deliberate exception to
+                    # FIFO -- but only if nothing newer for this topic
+                    # arrived while the failed publish was in flight;
+                    # newest-wins must never be overwritten by a stale
+                    # retry.
+                    if topic not in self._pending:
+                        self._pending[topic] = unit
+                    if self.diagnostics is not None:
+                        self.diagnostics.unit_queue_depth = len(self._pending)
+                    await asyncio.sleep(PUBLISH_RETRY_SECONDS)
+                    # Stop draining this cycle rather than immediately
+                    # trying the next pending topic: if the broker is dead,
+                    # every remaining item would fail too, and without this
+                    # break each one would serialize its own one-second
+                    # backoff (N pending units -> N seconds). One failure
+                    # is enough signal to back off once and re-evaluate.
+                    # There is now known pending work (the requeue above,
+                    # or whatever newer value pre-empted it) but nothing
+                    # new necessarily called submit() to set this wakeup --
+                    # without it the outer loop would hang waiting for an
+                    # external update that may never come.
+                    self._wakeup.set()
+                    break
                 else:
                     if self.diagnostics is not None:
                         self.diagnostics.unit_publish_confirmed += 1
-            self._idle.set()
+            if not self._pending:
+                self._idle.set()
 
     async def start(self) -> None:
         self._worker_task = asyncio.create_task(self._worker())
@@ -708,6 +773,21 @@ async def publish_entities(casa: Casambi, client: aiomqtt.Client) -> tuple[int, 
     return units_published, scenes_published
 
 
+_KNOWN_COMMAND_ACTIONS = frozenset(
+    {SetLevel.ACTION, TurnOn.ACTION, PublishEntities.ACTION, SetScene.ACTION}
+)
+
+
+def _safe_action_name(action: str) -> str:
+    """
+    Return the action name only if it is one of the four known constants.
+
+    ``action`` otherwise comes straight from the MQTT command payload, so it
+    is attacker/user-controlled text -- never log it verbatim.
+    """
+    return action if action in _KNOWN_COMMAND_ACTIONS else "<unrecognized>"
+
+
 async def process_command(
     message: aiomqtt.Message, casa: Casambi, client: aiomqtt.Client
 ) -> None:
@@ -719,7 +799,7 @@ async def process_command(
         payload = message.payload.decode()
         command = json.loads(payload)
     except (UnicodeDecodeError, json.JSONDecodeError) as error:
-        LOGGER.warning("Ignoring malformed MQTT command: %s", error)
+        LOGGER.warning("Ignoring malformed MQTT command: %s", type(error).__name__)
         return
 
     if not isinstance(command, dict):
@@ -753,9 +833,16 @@ async def process_command(
                 scene = next(s for s in casa.scenes if s.sceneId == scene_id)
                 await casa.switchToScene(scene)
             case _:
-                LOGGER.warning("Ignoring unknown Casambi command action: %s", action)
+                # action is never one of the four known constants here (the
+                # cases above already matched them), so this is always
+                # fixed text -- no interpolation of attacker-controlled input.
+                LOGGER.warning("Ignoring unknown Casambi command action")
     except (AttributeError, KeyError, StopIteration, TypeError, ValueError) as error:
-        LOGGER.warning("Unable to process Casambi command %s: %s", action, error)
+        LOGGER.warning(
+            "Unable to process Casambi command %s: %s",
+            _safe_action_name(action),
+            type(error).__name__,
+        )
 
 
 class CasambiDisconnected(RuntimeError):  # noqa: N818
@@ -803,59 +890,71 @@ async def run_heartbeat(
             LOGGER.info("Bridge diagnostics: %s", diagnostics.as_log_fields())
 
 
-async def _race_commands_against_disconnect(
-    command_task: asyncio.Task[None], disconnect_task: asyncio.Task[None]
+async def _race_session_against_disconnect(
+    session_task: asyncio.Task[None], disconnect_task: asyncio.Task[None]
 ) -> None:
     """
     Await whichever of the two finishes first and act accordingly.
 
-    Command-task-wins: propagate its result/exception exactly as if it had
-    been awaited directly (an aiomqtt.MqttError still reaches main()'s
-    reconnect loop unchanged). Disconnect-wins: log the one fixed warning and
-    raise CasambiDisconnected. Either way the loser is cancelled and awaited
-    so no task is leaked. If this coroutine itself is cancelled (normal
-    shutdown), cancel both children, await them, and let CancelledError
-    propagate untouched.
+    Precedence: the disconnect wins whenever it is part of the completed
+    set, even if the session task ALSO completed in the same tick -- that is
+    exactly what a BLE-induced MQTT teardown looks like (the broker
+    connection dies at the same moment the BLE link does), and a BLE loss
+    must never be masked by an MQTT-level symptom of that same loss. Any
+    outcome the session task produced in that case (a clean return, an
+    aiomqtt.MqttError, anything else) is discarded in favour of
+    CasambiDisconnected.
+
+    Session-task-wins cleanly (disconnect not set): propagate its
+    result/exception exactly as if it had been awaited directly (an
+    aiomqtt.MqttError still reaches main()'s reconnect loop unchanged).
+
+    Either way the loser is cancelled and awaited so no task is leaked. If
+    this coroutine itself is cancelled (normal shutdown), cancel both
+    children, await them, and let CancelledError propagate untouched.
     """
     try:
         done, _pending = await asyncio.wait(
-            {command_task, disconnect_task}, return_when=asyncio.FIRST_COMPLETED
+            {session_task, disconnect_task}, return_when=asyncio.FIRST_COMPLETED
         )
     except asyncio.CancelledError:
-        command_task.cancel()
+        session_task.cancel()
         disconnect_task.cancel()
         with contextlib.suppress(asyncio.CancelledError):
-            await command_task
+            await session_task
         with contextlib.suppress(asyncio.CancelledError):
             await disconnect_task
         raise
 
-    if command_task in done:
-        disconnect_task.cancel()
-        with contextlib.suppress(asyncio.CancelledError):
-            await disconnect_task
-        command_task.result()
-        return
+    if disconnect_task in done:
+        session_task.cancel()
+        with contextlib.suppress(BaseException):
+            await session_task
+        LOGGER.warning("Casambi BLE connection lost; bridge will restart")
+        raise CasambiDisconnected
 
-    command_task.cancel()
+    disconnect_task.cancel()
     with contextlib.suppress(asyncio.CancelledError):
-        await command_task
-    LOGGER.warning("Casambi BLE connection lost; bridge will restart")
-    raise CasambiDisconnected
+        await disconnect_task
+    session_task.result()
 
 
 @dataclass
 class _ConnectedBridgeHandles:
-    """Everything run_connected_bridge's finally needs to unwind cleanly."""
+    """
+    Everything run_connected_bridge's finally needs to unwind cleanly.
+
+    Does NOT include the BLE disconnect callback: that is registered once,
+    for the whole process lifetime, by main() -- run_connected_bridge only
+    receives the already-registered event to race against.
+    """
 
     unit_publisher: UnitStatePublisher
     switch_publisher: SwitchEventPublisher
     unit_callback: Any
-    on_ble_disconnect: Any
     heartbeat_task: asyncio.Task[None] | None = None
     unit_registered: bool = False
     switch_registered: bool = False
-    disconnect_registered: bool = False
 
 
 async def _cleanup_connected_bridge(
@@ -870,34 +969,35 @@ async def _cleanup_connected_bridge(
         with contextlib.suppress(Exception, asyncio.CancelledError):
             await handles.heartbeat_task
     try:
-        if handles.disconnect_registered:
-            casa.unregisterDisconnectCallback(handles.on_ble_disconnect)
+        if handles.switch_registered:
+            casa.unregisterSwitchEventHandler(handles.switch_publisher)
     finally:
         try:
-            if handles.switch_registered:
-                casa.unregisterSwitchEventHandler(handles.switch_publisher)
+            if handles.unit_registered:
+                casa.unregisterUnitChangedHandler(handles.unit_callback)
         finally:
             try:
-                if handles.unit_registered:
-                    casa.unregisterUnitChangedHandler(handles.unit_callback)
+                await handles.switch_publisher.aclose()
             finally:
-                try:
-                    await handles.switch_publisher.aclose()
-                finally:
-                    await handles.unit_publisher.aclose()
+                await handles.unit_publisher.aclose()
 
 
-async def run_connected_bridge(casa: Casambi, client: aiomqtt.Client) -> None:
-    """Run one connected MQTT session with paired callback cleanup."""
+async def run_connected_bridge(
+    casa: Casambi, client: aiomqtt.Client, disconnected: asyncio.Event
+) -> None:
+    """
+    Run one connected MQTT session with paired callback cleanup.
+
+    ``disconnected`` is owned and registered by main(), not here: this
+    function only races the ENTIRE session body -- subscribe, the baseline
+    snapshot, and the command loop -- against it, so a BLE drop at any point
+    during the session (including mid-snapshot) aborts that work and
+    surfaces as CasambiDisconnected, rather than hanging or completing as if
+    nothing happened.
+    """
     diagnostics = BridgeDiagnostics()
-    loop = asyncio.get_running_loop()
-    disconnected = asyncio.Event()
     unit_publisher = UnitStatePublisher(client, diagnostics=diagnostics)
     switch_publisher = SwitchEventPublisher(client, diagnostics=diagnostics)
-
-    def on_ble_disconnect() -> None:
-        with contextlib.suppress(RuntimeError):
-            loop.call_soon_threadsafe(disconnected.set)
 
     def unit_callback(unit: CasambiBt.Unit) -> None:
         diagnostics.unit_callbacks += 1
@@ -908,20 +1008,19 @@ async def run_connected_bridge(casa: Casambi, client: aiomqtt.Client) -> None:
 
     async def consume_commands() -> None:
         async for message in client.messages:
-            LOGGER.debug(
-                "Received command: %s on topic: '%s'",
-                message.payload.decode(),
-                message.topic,
-            )
+            # Bridge-owned: integers only. The decoded command topic and
+            # payload carry the network name, unit address/UUID, scene id
+            # and brightness value -- never log them, at any level.
+            diagnostics.commands_received += 1
             await process_command(message, casa, client)
 
     handles = _ConnectedBridgeHandles(
         unit_publisher=unit_publisher,
         switch_publisher=switch_publisher,
         unit_callback=unit_callback,
-        on_ble_disconnect=on_ble_disconnect,
     )
-    try:
+
+    async def session_body() -> None:
         await client.subscribe(f"{TOPIC_PREFIX}/{NETWORK_NAME}/commands")
 
         # Publish the baseline before registering live updates. Casambi can emit
@@ -935,17 +1034,18 @@ async def run_connected_bridge(casa: Casambi, client: aiomqtt.Client) -> None:
         handles.unit_registered = True
         casa.registerSwitchEventHandler(switch_publisher)
         handles.switch_registered = True
-        casa.registerDisconnectCallback(on_ble_disconnect)
-        handles.disconnect_registered = True
 
         handles.heartbeat_task = asyncio.create_task(run_heartbeat(diagnostics))
 
         LOGGER.info("Subscribed to commands and registered Casambi event handlers")
 
-        command_task = asyncio.create_task(consume_commands())
+        await consume_commands()
+
+    try:
+        session_task = asyncio.create_task(session_body())
         disconnect_task = asyncio.create_task(disconnected.wait())
         try:
-            await _race_commands_against_disconnect(command_task, disconnect_task)
+            await _race_session_against_disconnect(session_task, disconnect_task)
         except CasambiDisconnected:
             diagnostics.ble_disconnects += 1
             raise
@@ -953,7 +1053,7 @@ async def run_connected_bridge(casa: Casambi, client: aiomqtt.Client) -> None:
         await _cleanup_connected_bridge(casa, handles)
 
 
-async def main() -> None:
+async def main(*, sleep: Any = asyncio.sleep) -> None:
     if not is_valid_network_name(NETWORK_NAME):
         message = "CASAMBI_NETWORK_NAME must be one literal, non-empty MQTT topic level"
         raise RuntimeError(message)
@@ -971,28 +1071,62 @@ async def main() -> None:
         sys.exit(0)
 
     casa = create_casambi_connection()
+    disconnected = asyncio.Event()
+    disconnect_registered = False
     try:
         await casa.connect(device, NETWORK_PASSWORD)
         LOGGER.info("Connected to Casambi network")
+
+        loop = asyncio.get_running_loop()
+
+        def on_ble_disconnect() -> None:
+            with contextlib.suppress(RuntimeError):
+                loop.call_soon_threadsafe(disconnected.set)
+
+        # One registration for the whole process lifetime, owned here --
+        # NOT inside run_connected_bridge -- so a BLE drop in the window
+        # between connecting and the first MQTT session (or during any
+        # later reconnect gap) is never silently missed.
+        casa.registerDisconnectCallback(on_ble_disconnect)
+        disconnect_registered = True
+        # Yield once so a disconnect scheduled via call_soon_threadsafe in
+        # the narrow window right after registration is observed by the
+        # check below instead of being acted on one loop iteration late.
+        await sleep(0)
+        if disconnected.is_set():
+            raise CasambiDisconnected
+
         client = aiomqtt.Client(
             MQTT_BROKER, port=MQTT_PORT, username=MQTT_USERNAME, password=MQTT_PASSWORD
         )
         interval = 5
 
         while True:
+            if disconnected.is_set():
+                raise CasambiDisconnected
             try:
                 async with client:
-                    await run_connected_bridge(casa, client)
+                    await run_connected_bridge(casa, client, disconnected)
             except aiomqtt.MqttError as e:
+                # A BLE loss must never be retried as an MQTT reconnect: an
+                # MqttError arriving here can be the MQTT-level symptom of
+                # the very same BLE drop (broker TCP session torn down at
+                # the same moment), so the disconnect always takes
+                # precedence over treating this as an ordinary connectivity
+                # hiccup.
+                if disconnected.is_set():
+                    raise CasambiDisconnected from None
                 LOGGER.warning(
                     "Connection lost (%s); Reconnecting in %d seconds ...", e, interval
                 )
-                await asyncio.sleep(interval)
+                await sleep(interval)
             except asyncio.CancelledError:
                 LOGGER.info("Main task cancelled, waiting for cleanup")
                 break
 
     finally:
+        if disconnect_registered:
+            casa.unregisterDisconnectCallback(on_ble_disconnect)
         LOGGER.info("Shutting down..")
         await casa.disconnect()
 

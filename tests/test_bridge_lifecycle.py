@@ -10,6 +10,7 @@ doubles) so the two suites do not depend on each other's internals.
 import asyncio
 import importlib.util
 import io
+import json
 import logging
 import re
 import sys
@@ -278,7 +279,15 @@ async def wait_until(predicate, *, attempts=500):
 THIRTY_SECOND_HANDLER_ATTEMPTS = 50
 
 
-async def wait_for_registration(casa, *, attribute="_disconnect_cb"):
+async def wait_for_registration(casa, *, attribute="_switch_cb"):
+    """
+    Poll (bounded, no fixed sleep duration) until a handler is registered.
+
+    Defaults to "_switch_cb" -- the last handler session_body registers --
+    rather than "_disconnect_cb": the BLE disconnect callback is owned and
+    registered by main() now, not by run_connected_bridge, so casa's
+    _disconnect_cb attribute is never set by these tests at all.
+    """
     for _ in range(THIRTY_SECOND_HANDLER_ATTEMPTS):
         if getattr(casa, attribute) is not None:
             return
@@ -478,16 +487,25 @@ def test_configure_logging_still_routes_mqtt_logger_if_casambi_bt_already_has_a_
 
 
 @pytest.mark.asyncio
-async def test_unexpected_ble_disconnect_raises_and_cleans_up(server, caplog):
+async def test_ble_disconnect_during_command_loop_raises_and_cleans_up(server, caplog):
+    """
+    disconnected is now owned by main(): run_connected_bridge only receives
+    an already-existing event and races the whole session against it. This
+    test drives that event directly (no more casa.registerDisconnectCallback
+    indirection, since run_connected_bridge no longer touches it at all).
+    """
     caplog.set_level(logging.WARNING)
     casa = DisconnectCasa()
     client = BridgeMqttClient(BlockingMessageStream())
+    disconnected = asyncio.Event()
     baseline_tasks = asyncio.all_tasks()
 
-    bridge_task = asyncio.create_task(server.run_connected_bridge(casa, client))
+    bridge_task = asyncio.create_task(
+        server.run_connected_bridge(casa, client, disconnected)
+    )
     await wait_for_registration(casa)
 
-    casa._disconnect_cb()
+    disconnected.set()
 
     with pytest.raises(server.CasambiDisconnected):
         await bridge_task
@@ -495,8 +513,6 @@ async def test_unexpected_ble_disconnect_raises_and_cleans_up(server, caplog):
     assert [entry[0] for entry in casa.lifecycle] == [
         "register-unit",
         "register-switch",
-        "register-disconnect",
-        "unregister-disconnect",
         "unregister-switch",
         "unregister-unit",
     ]
@@ -524,9 +540,12 @@ async def test_cancelling_bridge_task_is_clean_shutdown_with_no_warning(server, 
     caplog.set_level(logging.WARNING)
     casa = DisconnectCasa()
     client = BridgeMqttClient(BlockingMessageStream())
+    disconnected = asyncio.Event()
     baseline_tasks = asyncio.all_tasks()
 
-    bridge_task = asyncio.create_task(server.run_connected_bridge(casa, client))
+    bridge_task = asyncio.create_task(
+        server.run_connected_bridge(casa, client, disconnected)
+    )
     await wait_for_registration(casa)
 
     bridge_task.cancel()
@@ -536,8 +555,6 @@ async def test_cancelling_bridge_task_is_clean_shutdown_with_no_warning(server, 
     assert [entry[0] for entry in casa.lifecycle] == [
         "register-unit",
         "register-switch",
-        "register-disconnect",
-        "unregister-disconnect",
         "unregister-switch",
         "unregister-unit",
     ]
@@ -627,32 +644,183 @@ async def test_unit_publisher_stays_bounded_during_slow_broker_ack(server):
 
 
 @pytest.mark.asyncio
-async def test_unit_publisher_survives_mqtt_and_runtime_publish_failures(server, caplog):
+async def test_unit_publisher_survives_publish_failures_and_worker_keeps_going(
+    server, caplog, monkeypatch
+):
+    """
+    Both failure kinds (aiomqtt.MqttError and a generic exception) must be
+    survived by the worker, counted truthfully, and -- since blocker 3 now
+    requeues on failure -- eventually succeed once the transient failure
+    clears, proving the retry path is genuinely self-healing rather than
+    just "logged and dropped".
+    """
+    monkeypatch.setattr(server, "PUBLISH_RETRY_SECONDS", 0.01)
     caplog.set_level(logging.WARNING)
 
-    class FlakyClient:
+    class FlakyOnceClient:
+        """Each named failure topic fails exactly once, then succeeds."""
+
         def __init__(self):
             self.calls = []
+            self._failed_once = set()
 
         async def publish(self, topic, **kwargs):
-            if "mqtt-fail" in topic:
-                raise aiomqtt.MqttError("boom")
-            if "runtime-fail" in topic:
+            if topic not in self._failed_once and (
+                "mqtt-fail" in topic or "runtime-fail" in topic
+            ):
+                self._failed_once.add(topic)
+                if "mqtt-fail" in topic:
+                    raise aiomqtt.MqttError("boom")
                 raise RuntimeError("boom")
             self.calls.append((topic, kwargs))
 
-    client = FlakyClient()
-    publisher = server.UnitStatePublisher(client)
+    client = FlakyOnceClient()
+    diagnostics = server.BridgeDiagnostics()
+    publisher = server.UnitStatePublisher(client, diagnostics=diagnostics)
     await publisher.start()
 
     publisher.submit(make_unit("unit-mqtt-fail"))
     await wait_until(lambda: any(r.levelno == logging.WARNING for r in caplog.records))
+    # A publish failure -- MqttError or otherwise -- must be counted
+    # truthfully as failed, never as confirmed, per blocker 3.
+    assert diagnostics.unit_publish_confirmed == 0
+    assert diagnostics.unit_publish_failed >= 1
 
     publisher.submit(make_unit("unit-runtime-fail"))
     publisher.submit(make_unit("unit-ok"))
-    await wait_until(lambda: len(client.calls) == 1)
+    await wait_until(lambda: len(client.calls) == 3, attempts=5000)
 
-    assert publisher.failed == 1
+    assert publisher.failed >= 2
+    assert sorted(topic for topic, _ in client.calls) == sorted(
+        [
+            server.unit_event_topic(make_unit("unit-mqtt-fail")),
+            server.unit_event_topic(make_unit("unit-runtime-fail")),
+            server.unit_event_topic(make_unit("unit-ok")),
+        ]
+    )
+    await publisher.aclose(drain_timeout=0.5)
+
+
+@pytest.mark.asyncio
+async def test_unit_publisher_requeues_failed_publish_without_losing_newest_state(
+    server, monkeypatch
+):
+    """
+    Regression for blocker 3: publish_unit's suppress_errors=False path lets
+    aiomqtt.MqttError reach the worker, which must requeue the unit rather
+    than lose it -- but a fresher value submitted while the failed publish
+    was still in flight must survive untouched by the stale requeue.
+    """
+    monkeypatch.setattr(server, "PUBLISH_RETRY_SECONDS", 0.01)
+
+    class FlakyThenOkClient:
+        def __init__(self):
+            self.calls = []
+            self.should_fail = True
+            self.publisher = None  # bound after construction
+
+        async def publish(self, topic, **kwargs):
+            if self.should_fail:
+                self.should_fail = False
+                # Simulate a newer update landing while this attempt is
+                # in flight and about to fail.
+                self.publisher.submit(make_unit("unit-retry", dimmer=99))
+                raise aiomqtt.MqttError("boom")
+            self.calls.append((topic, kwargs))
+
+    client = FlakyThenOkClient()
+    diagnostics = server.BridgeDiagnostics()
+    publisher = server.UnitStatePublisher(client, diagnostics=diagnostics)
+    client.publisher = publisher
+    await publisher.start()
+
+    publisher.submit(make_unit("unit-retry", dimmer=1))
+
+    await wait_until(lambda: diagnostics.unit_publish_failed >= 1)
+    assert diagnostics.unit_publish_confirmed == 0
+    assert len(client.calls) == 0
+    # The newer value (dimmer=99), submitted mid-failure, must survive; the
+    # requeued stale value (dimmer=1) must NOT overwrite it.
+    assert len(publisher._pending) == 1  # noqa: SLF001
+    pending_unit = next(iter(publisher._pending.values()))  # noqa: SLF001
+    assert pending_unit.state.dimmer == 99
+
+    await wait_until(lambda: len(client.calls) == 1, attempts=3000)
+    payload = json.loads(client.calls[0][1]["payload"])
+    assert payload["state"]["dimmer"] == 99
+    assert diagnostics.unit_publish_confirmed == 1
+
+    await publisher.aclose(drain_timeout=0.5)
+
+
+@pytest.mark.asyncio
+async def test_unit_publisher_backs_off_instead_of_spinning_on_dead_broker(
+    server, monkeypatch
+):
+    """A dead broker must produce at most one publish attempt per second."""
+    monkeypatch.setattr(server, "PUBLISH_RETRY_SECONDS", 0.05)
+
+    class AlwaysFailingClient:
+        def __init__(self):
+            self.attempts = 0
+
+        async def publish(self, topic, **kwargs):
+            self.attempts += 1
+            raise aiomqtt.MqttError("dead broker")
+
+    client = AlwaysFailingClient()
+    publisher = server.UnitStatePublisher(client)
+    await publisher.start()
+
+    publisher.submit(make_unit("unit-a"))
+    publisher.submit(make_unit("unit-b"))
+
+    await wait_until(lambda: client.attempts >= 1)
+    # Give the worker a bounded window in which, absent the backoff, it
+    # would have spun through both (and re-retried) many times over.
+    await asyncio.sleep(0.12)
+    # At 0.05s backoff and ~0.12s elapsed, at most a handful of attempts
+    # are possible -- nowhere near a tight spin loop.
+    assert client.attempts <= 5
+
+    await publisher.aclose(drain_timeout=0.2)
+
+
+@pytest.mark.asyncio
+async def test_unit_publisher_fifo_drain_does_not_starve_a_cold_unit(server):
+    """
+    Regression for blocker 4: a hot unit resubmitted on every publish must
+    not starve a cold unit that was already pending -- FIFO drain plus
+    in-place coalescing (submit() never deletes-then-reinserts) guarantees
+    the cold unit, submitted first, is drained before the hot unit's
+    churn can get ahead of it.
+    """
+    calls = []
+
+    class ResubmittingClient:
+        def __init__(self):
+            self.publisher = None  # bound after construction
+
+        async def publish(self, topic, **kwargs):
+            await asyncio.sleep(0)
+            calls.append((topic, kwargs))
+            if "hot" in topic:
+                self.publisher.submit(make_unit("hot", dimmer=len(calls)))
+
+    client = ResubmittingClient()
+    publisher = server.UnitStatePublisher(client)
+    client.publisher = publisher
+    await publisher.start()
+
+    publisher.submit(make_unit("cold", dimmer=1))
+    publisher.submit(make_unit("hot", dimmer=1))
+
+    await wait_until(lambda: any("cold" in topic for topic, _ in calls), attempts=500)
+
+    cold_turn_index = next(i for i, (topic, _) in enumerate(calls) if "cold" in topic)
+    assert cold_turn_index < 2
+    assert len([c for c in calls if "cold" in c[0]]) == 1
+
     await publisher.aclose(drain_timeout=0.2)
 
 
@@ -787,13 +955,16 @@ async def test_bridge_owned_and_redacted_logging_never_leaks_private_data(
             make_unit(fake_mac, name=fake_unit_name, uuid=fake_uuid, dimmer=10)
         ]
         client = BridgeMqttClient(BlockingMessageStream())
+        disconnected = asyncio.Event()
 
-        bridge_task = asyncio.create_task(server.run_connected_bridge(casa, client))
+        bridge_task = asyncio.create_task(
+            server.run_connected_bridge(casa, client, disconnected)
+        )
         await wait_for_registration(casa)
         casa._unit_cb(
             make_unit(fake_mac, name=fake_unit_name, uuid=fake_uuid, dimmer=200)
         )
-        casa._disconnect_cb()
+        disconnected.set()
         with pytest.raises(server.CasambiDisconnected):
             await bridge_task
 
@@ -830,3 +1001,313 @@ async def test_bridge_owned_and_redacted_logging_never_leaks_private_data(
             assert not re.search(r"[0-9a-f]{8,}", blob), blob
     finally:
         casambi_logger.removeHandler(casambi_capture)
+
+
+# ---------------------------------------------------------------------------
+# A2. Command logging privacy (round 2 -- blocker 1)
+# ---------------------------------------------------------------------------
+
+
+class MultiMessageStream:
+    """Yields each message in order, once, then stops -- no blocking."""
+
+    def __init__(self, messages):
+        self._iterator = iter(messages)
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        try:
+            return next(self._iterator)
+        except StopIteration:
+            raise StopAsyncIteration from None
+
+
+@pytest.mark.asyncio
+async def test_bridge_command_handling_never_logs_topic_payload_or_raw_action(
+    server, caplog, monkeypatch
+):
+    """
+    Regression for blocker 1: consume_commands used to LOGGER.debug() the
+    full decoded MQTT payload and topic (network name, unit address/UUID,
+    scene id, brightness). That call is gone, replaced by an integer
+    counter. This also exercises the two sibling leaks in process_command:
+    an unrecognized action string must never be echoed back, and a caught
+    exception must be logged by its type name, never str(error).
+
+    Privacy must not be level-dependent, so caplog is captured at DEBUG.
+    """
+    caplog.set_level(logging.DEBUG)
+    fake_network = "Secret-Vacation-House-Network"
+    monkeypatch.setattr(server, "NETWORK_NAME", fake_network)
+
+    fake_uuid = "9f2c6b7acafebabe1234-secret-unit-uuid"
+    fake_mac = "AA:BB:CC:DD:EE:FF"
+    scene_id = 424242
+    brightness = 137
+    unknown_action = "SECRETACTIONMARKER"
+
+    topic = f"casambi/{fake_network}/commands"
+    messages = [
+        types.SimpleNamespace(
+            topic=topic,
+            payload=json.dumps(
+                {
+                    "action": "SET_LEVEL",
+                    "address": fake_mac,
+                    "unit_uuid": fake_uuid,
+                    "value": brightness,
+                }
+            ).encode(),
+        ),
+        types.SimpleNamespace(
+            topic=topic,
+            payload=json.dumps({"action": "SET_SCENE", "scene_id": scene_id}).encode(),
+        ),
+        types.SimpleNamespace(
+            topic=topic,
+            payload=json.dumps({"action": unknown_action}).encode(),
+        ),
+    ]
+
+    # casa.units/scenes are empty, so SET_LEVEL and SET_SCENE both hit the
+    # except clause in process_command (ValueError / StopIteration) --
+    # exercising the "type(error).__name__, not str(error)" fix too.
+    casa = DisconnectCasa()
+    client = BridgeMqttClient(MultiMessageStream(messages))
+    disconnected = asyncio.Event()
+
+    await server.run_connected_bridge(casa, client, disconnected)
+
+    markers = [
+        fake_network,
+        fake_uuid,
+        fake_mac,
+        str(scene_id),
+        str(brightness),
+        unknown_action,
+        topic,
+    ]
+    blobs = [r.getMessage() for r in caplog.records]
+    blobs.append(repr(server.BridgeDiagnostics()))
+    for blob in blobs:
+        for marker in markers:
+            assert marker not in blob, (marker, blob)
+
+
+# ---------------------------------------------------------------------------
+# B2. Disconnect lifecycle ownership and precedence (round 2 -- blocker 2)
+# ---------------------------------------------------------------------------
+
+
+class FakeMainCasa:
+    """Fake Casambi connection for testing main()'s own disconnect handling."""
+
+    def __init__(self):
+        self.calls = []
+        self._disconnect_cb = None
+
+    async def connect(self, device, password):
+        self.calls.append("connect")
+
+    def registerDisconnectCallback(self, callback):
+        self.calls.append("register-disconnect")
+        self._disconnect_cb = callback
+
+    def unregisterDisconnectCallback(self, callback):
+        self.calls.append("unregister-disconnect")
+
+    async def disconnect(self):
+        self.calls.append("disconnect")
+
+
+class FakeMainClientCtx:
+    """Minimal async-context-manager stand-in for aiomqtt.Client."""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc_info):
+        return False
+
+
+@pytest.mark.asyncio
+async def test_disconnect_during_baseline_snapshot_aborts_and_raises(server, caplog):
+    """
+    Required test 1: a BLE drop during publish_entities' baseline snapshot
+    must abort it and surface as CasambiDisconnected, not hang or complete
+    normally -- proving run_connected_bridge races the WHOLE session body,
+    not just the command loop.
+
+    Deterministic: the fake client blocks forever on its first publish
+    call, and only once the test has *confirmed* (via an Event) that the
+    session task is genuinely stuck there does it fire the disconnect --
+    no sleeps, no scheduling luck.
+    """
+    caplog.set_level(logging.WARNING)
+    disconnected = asyncio.Event()
+    casa = DisconnectCasa()
+    casa.units = [make_unit("unit-a"), make_unit("unit-b")]
+    casa.scenes = []
+    reached_publish = asyncio.Event()
+
+    class BlockingFirstPublishClient(BridgeMqttClient):
+        def __init__(self):
+            super().__init__()
+            self.publish_calls = 0
+
+        async def publish(self, topic, **kwargs):
+            self.publish_calls += 1
+            if self.publish_calls == 1:
+                reached_publish.set()
+                await asyncio.Future()  # blocks until cancelled
+            await super().publish(topic, **kwargs)
+
+    client = BlockingFirstPublishClient()
+    bridge_task = asyncio.create_task(
+        server.run_connected_bridge(casa, client, disconnected)
+    )
+
+    await asyncio.wait_for(reached_publish.wait(), timeout=5.0)
+    # session_task is now deterministically blocked inside the very first
+    # publish_entities call -- the snapshot has started but not finished.
+    disconnected.set()
+
+    with pytest.raises(server.CasambiDisconnected):
+        await bridge_task
+
+    # Aborted before any handler registration -- proves the abort happened
+    # during the snapshot, not later during the command loop.
+    assert casa.lifecycle == []
+    assert client.publish_calls == 1
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert warnings[0].getMessage() == "Casambi BLE connection lost; bridge will restart"
+
+
+@pytest.mark.asyncio
+async def test_main_raises_disconnected_without_mqtt_connect_if_set_at_startup(
+    server, monkeypatch
+):
+    """
+    Required test 2: if the BLE link is already gone by the time main()
+    would otherwise start an MQTT session, it must raise CasambiDisconnected
+    without ever constructing an aiomqtt.Client or entering
+    run_connected_bridge -- a BLE loss must never be attempted as an MQTT
+    connect in the first place.
+    """
+    device = types.SimpleNamespace(address="configured-address")
+
+    async def discover():
+        return [device]
+
+    casa = FakeMainCasa()
+
+    def register_and_fire_immediately(callback):
+        casa.calls.append("register-disconnect")
+        casa._disconnect_cb = callback
+        callback()  # schedules disconnected.set() via call_soon_threadsafe;
+        # main()'s own post-registration yield (await sleep(0)) observes it.
+
+    casa.registerDisconnectCallback = register_and_fire_immediately
+
+    def client_must_not_be_constructed(*args, **kwargs):
+        pytest.fail("must not construct an MQTT client when already disconnected")
+
+    async def run_connected_bridge_must_not_run(*args, **kwargs):
+        pytest.fail("must not enter a session when already disconnected")
+
+    monkeypatch.setattr(server, "NETWORK_ADDRESS", device.address)
+    monkeypatch.setattr(server, "discover", discover)
+    monkeypatch.setattr(server, "create_casambi_connection", lambda: casa)
+    monkeypatch.setattr(server.aiomqtt, "Client", client_must_not_be_constructed)
+    monkeypatch.setattr(server, "run_connected_bridge", run_connected_bridge_must_not_run)
+
+    with pytest.raises(server.CasambiDisconnected):
+        await server.main()
+
+    assert casa.calls == [
+        "connect",
+        "register-disconnect",
+        "unregister-disconnect",
+        "disconnect",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_race_precedence_disconnect_wins_when_both_complete_same_tick(server):
+    """
+    Required test 3: when asyncio.wait() returns with BOTH the session task
+    (having raised aiomqtt.MqttError) and the disconnect task already done
+    in the same tick -- exactly what a BLE-induced MQTT teardown looks like
+    -- the disconnect must win. Deterministic: both tasks are explicitly
+    awaited to real completion before the race function is ever called, so
+    there is no ordering luck involved in reaching the "both done" case.
+    """
+    disconnected = asyncio.Event()
+    disconnected.set()
+
+    async def failing_session():
+        raise aiomqtt.MqttError("boom")
+
+    session_task = asyncio.create_task(failing_session())
+    disconnect_task = asyncio.create_task(disconnected.wait())
+
+    for _ in range(50):
+        if session_task.done() and disconnect_task.done():
+            break
+        await asyncio.sleep(0)
+    assert session_task.done()
+    assert disconnect_task.done()
+
+    with pytest.raises(server.CasambiDisconnected):
+        await server._race_session_against_disconnect(session_task, disconnect_task)
+
+
+@pytest.mark.asyncio
+async def test_main_reconnects_normally_on_mqtt_error_when_not_disconnected(
+    server, monkeypatch
+):
+    """
+    Required test 4: an aiomqtt.MqttError with the disconnect event unset
+    must still hit the ordinary reconnect path (warn + backoff + retry),
+    completely unaffected by the new disconnect-precedence guard.
+    """
+    device = types.SimpleNamespace(address="configured-address")
+
+    async def discover():
+        return [device]
+
+    casa = FakeMainCasa()
+    attempts = []
+
+    async def fake_run_connected_bridge(casa_arg, client_arg, disconnected_arg):
+        attempts.append("run")
+        if len(attempts) == 1:
+            raise aiomqtt.MqttError("boom")
+        raise asyncio.CancelledError  # deterministically end the loop
+
+    sleeps = []
+
+    async def fake_sleep(seconds):
+        sleeps.append(seconds)
+
+    monkeypatch.setattr(server, "NETWORK_ADDRESS", device.address)
+    monkeypatch.setattr(server, "discover", discover)
+    monkeypatch.setattr(server, "create_casambi_connection", lambda: casa)
+    monkeypatch.setattr(server.aiomqtt, "Client", lambda *a, **k: FakeMainClientCtx())
+    monkeypatch.setattr(server, "run_connected_bridge", fake_run_connected_bridge)
+
+    await server.main(sleep=fake_sleep)
+
+    assert attempts == ["run", "run"]
+    # sleeps[0] is the post-registration startup yield; sleeps[1] is the
+    # 5-second reconnect backoff -- both real behaviour, no real delay here.
+    assert sleeps == [0, 5]
+    assert casa.calls == [
+        "connect",
+        "register-disconnect",
+        "unregister-disconnect",
+        "disconnect",
+    ]

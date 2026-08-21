@@ -531,19 +531,20 @@ async def test_connected_bridge_registers_and_cleans_up_both_callback_types(serv
     casa = LifecycleCasa()
     client = BridgeMqttClient()
 
-    await server.run_connected_bridge(casa, client)
+    # The BLE disconnect callback is registered once, by main(), for the
+    # whole process lifetime -- not here. run_connected_bridge only races
+    # the session against an already-existing event.
+    await server.run_connected_bridge(casa, client, asyncio.Event())
 
     assert client.subscriptions == ["casambi/default/commands"]
     assert [entry[0] for entry in casa.lifecycle] == [
         "register-unit",
         "register-switch",
-        "register-disconnect",
-        "unregister-disconnect",
         "unregister-switch",
         "unregister-unit",
     ]
-    assert casa.lifecycle[0][1] is casa.lifecycle[5][1]
-    assert casa.lifecycle[1][1] is casa.lifecycle[4][1]
+    assert casa.lifecycle[0][1] is casa.lifecycle[3][1]
+    assert casa.lifecycle[1][1] is casa.lifecycle[2][1]
     assert isinstance(casa.lifecycle[1][1], server.SwitchEventPublisher)
     assert [topic for topic, _ in client.published_messages] == [
         "casambi/default/events/",
@@ -562,20 +563,18 @@ async def test_connected_bridge_unregisters_before_reconnect_after_failure(
     caplog.set_level("WARNING")
 
     with pytest.raises(RuntimeError, match="mqtt session lost"):
-        await server.run_connected_bridge(casa, BridgeMqttClient(FailingMessageStream()))
-    await server.run_connected_bridge(casa, BridgeMqttClient())
+        await server.run_connected_bridge(
+            casa, BridgeMqttClient(FailingMessageStream()), asyncio.Event()
+        )
+    await server.run_connected_bridge(casa, BridgeMqttClient(), asyncio.Event())
 
     assert [entry[0] for entry in casa.lifecycle] == [
         "register-unit",
         "register-switch",
-        "register-disconnect",
-        "unregister-disconnect",
         "unregister-switch",
         "unregister-unit",
         "register-unit",
         "register-switch",
-        "register-disconnect",
-        "unregister-disconnect",
         "unregister-switch",
         "unregister-unit",
     ]
