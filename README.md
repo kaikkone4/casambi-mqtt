@@ -15,7 +15,7 @@ A local-push Home Assistant integration for Casambi networks. A separate Bluetoo
 ### 0.2.8
 
 - Fixes PTM/Casambi switch-event invocation frame decoding while retaining `casambi-bt==0.3.2` and the public sanitized MQTT contract.
-- Button identities remain numeric and unlabeled pending physical validation; existing automation bound to the prior erroneous button 4 may require reassignment after that validation, without any mapping being assumed here.
+- Button identities are intentionally numeric and configuration-specific; see **Button mapping in Home Assistant** below before creating automations.
 - Switch events remain input-only: the bridge adds no event control path.
 
 ### 0.2.7
@@ -113,6 +113,23 @@ monotonic clock. A `PRESS` and `RELEASE` are distinct tuples, so the real
 press/release sequence is preserved. The handler is unregistered whenever the
 MQTT session reconnects or the bridge shuts down. This topic does not control a
 device and does not create or trigger a Home Assistant entity, scene, or action.
+
+### Button mapping in Home Assistant
+
+`button` is the numeric event identity configured by Casambi. It is **not** a
+universal physical rocker label: depending on the switch model and its Casambi
+configuration, a four-button/2-rocker switch can report non-sequential values
+or values such as `6` and `8`. Treat each switch's mapping as device-specific.
+
+Before creating an automation, open that switch's page in the Home Assistant
+Casambi MQTT integration and press one physical button at a time. Confirm which
+button event/entity activates, then bind the automation to that observed numeric
+button. Do not assume that the same physical position uses the same number on a
+different Casambi switch or after its Casambi configuration changes.
+
+For long press behavior, observe the switch's own event sequence before using
+it for dimming or stateful automation: configurations can differ between
+`HOLD`, `RELEASE_AFTER_HOLD`, and `PRESS`/`RELEASE` sequences.
 
 ### Bounded switch-event probe
 
