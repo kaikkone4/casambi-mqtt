@@ -6,6 +6,12 @@ A local-push Home Assistant integration for Casambi networks. A separate Bluetoo
 
 ## Release notes
 
+### 0.2.9
+
+- Hardens the Bluetooth bridge against silent Casambi BLE disconnects: it exits for supervisor restart instead of remaining active without updates.
+- Bounds and fairly schedules MQTT state publication, preserves the newest state during transient publish failures, and keeps retry diagnostics privacy-safe and rate-limited.
+- The public MQTT contract and `casambi-bt==0.3.2` remain unchanged. This is reliability hardening, not a claim about the earlier incident's root cause.
+
 ### 0.2.8
 
 - Fixes PTM/Casambi switch-event invocation frame decoding while retaining `casambi-bt==0.3.2` and the public sanitized MQTT contract.
