@@ -539,6 +539,21 @@ class UnitStatePublisher:
     spin loop. This is self-healing beyond that: a broken MQTT session also
     fails the command task, which tears the whole session down and
     republishes the full baseline on reconnect.
+
+
+    Log volume: a contiguous run of failures (a "streak") logs exactly ONE
+    warning, when it starts -- not one per retry. With PUBLISH_RETRY_SECONDS
+    == 1.0, a half-open broker would otherwise produce one identical
+    warning per second for as long as the session stays up-but-failing,
+    which is dense enough to trip journald rate limiting and can silently
+    drop OTHER records queued around it -- including the single BLE
+    disconnect warning this whole class of hardening exists to keep
+    visible. The first successful publish that ends a streak logs exactly
+    one integer-only recovery summary. ``_failure_streak`` is plain
+    per-instance state with no explicit reset on teardown: a session
+    tear-down discards this UnitStatePublisher and a fresh one is
+    constructed for the next session, so the streak count starts at zero
+    again by construction, not by any special-cased cleanup code.
     """
 
     def __init__(
@@ -552,6 +567,7 @@ class UnitStatePublisher:
         self.diagnostics = diagnostics
         self.failed = 0
         self._sleep = sleep
+        self._failure_streak = 0
         self._pending: dict[str, CasambiBt.Unit] = {}
         self._wakeup = asyncio.Event()
         self._idle = asyncio.Event()
@@ -594,11 +610,16 @@ class UnitStatePublisher:
                     await publish_unit(unit, self.client, suppress_errors=False)
                 except Exception:  # noqa: BLE001  # Never let one publish kill the worker.
                     self.failed += 1
+                    self._failure_streak += 1
                     if self.diagnostics is not None:
                         self.diagnostics.unit_publish_failed += 1
-                    LOGGER.warning(
-                        "Unit state publish failed; retrying after a backoff"
-                    )
+                    # One warning per streak, logged only when it starts --
+                    # see the class docstring for why repeating this every
+                    # retry is dangerous, not just noisy.
+                    if self._failure_streak == 1:
+                        LOGGER.warning(
+                            "Unit state publish failed; retrying after a backoff"
+                        )
                     # Requeue at the back -- the one deliberate exception to
                     # FIFO -- but only if nothing newer for this topic
                     # arrived while the failed publish was in flight;
@@ -623,6 +644,12 @@ class UnitStatePublisher:
                     self._wakeup.set()
                     break
                 else:
+                    if self._failure_streak > 0:
+                        LOGGER.info(
+                            "Unit state publishing recovered after %d failed attempts",
+                            self._failure_streak,
+                        )
+                        self._failure_streak = 0
                     if self.diagnostics is not None:
                         self.diagnostics.unit_publish_confirmed += 1
             if not self._pending:

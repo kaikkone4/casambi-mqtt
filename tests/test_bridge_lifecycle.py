@@ -845,6 +845,250 @@ async def test_unit_publisher_fifo_drain_does_not_starve_a_cold_unit(server):
     await publisher.aclose(drain_timeout=0.2)
 
 
+# ---------------------------------------------------------------------------
+# C2. Failure-streak log volume (round 3)
+# ---------------------------------------------------------------------------
+#
+# server.py:599-601 used to LOGGER.warning() on EVERY failed retry. With
+# PUBLISH_RETRY_SECONDS == 1.0, a half-open broker produced one identical
+# warning per second for as long as the session stayed up-but-failing --
+# dense enough to trip journald rate limiting, which can then drop other
+# records queued around the flood, including the single BLE-disconnect
+# warning this whole PR exists to keep visible. These tests pin the fix:
+# at most one warning per contiguous failure streak, and exactly one
+# integer-only recovery summary on the first success that ends it.
+
+
+@pytest.mark.asyncio
+async def test_unit_publisher_logs_exactly_one_warning_per_failure_streak(
+    server, caplog
+):
+    caplog.set_level(logging.WARNING)
+    sleep_calls = []
+
+    class AlwaysFailingClient:
+        async def publish(self, topic, **kwargs):
+            raise aiomqtt.MqttError("dead broker")
+
+    client = AlwaysFailingClient()
+    publisher = server.UnitStatePublisher(client, sleep=_yielding_fake_sleep(sleep_calls))
+    await publisher.start()
+
+    publisher.submit(make_unit("unit-a"))
+
+    # At least 50 consecutive failures, deterministically -- the fake sleep
+    # never really delays, so this is fast regardless of machine speed.
+    await wait_until(lambda: len(sleep_calls) >= 50)
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1
+    assert (
+        warnings[0].getMessage() == "Unit state publish failed; retrying after a backoff"
+    )
+
+    await publisher.aclose(drain_timeout=0.2)
+
+
+@pytest.mark.asyncio
+async def test_unit_publisher_logs_one_integer_only_recovery_after_a_streak(
+    server, caplog
+):
+    caplog.set_level(logging.INFO)
+    fail_count = 9
+
+    class FailsNTimesThenOkClient:
+        def __init__(self):
+            self.attempts = 0
+            self.calls = []
+
+        async def publish(self, topic, **kwargs):
+            self.attempts += 1
+            if self.attempts <= fail_count:
+                raise aiomqtt.MqttError("boom")
+            self.calls.append((topic, kwargs))
+
+    client = FailsNTimesThenOkClient()
+    publisher = server.UnitStatePublisher(client, sleep=_yielding_fake_sleep([]))
+    await publisher.start()
+
+    publisher.submit(make_unit("unit-a"))
+    await wait_until(lambda: len(client.calls) == 1)
+
+    info_records = [r for r in caplog.records if r.levelno == logging.INFO]
+    assert len(info_records) == 1
+    message = info_records[0].getMessage()
+    assert message == f"Unit state publishing recovered after {fail_count} failed attempts"
+    # Nothing in the line except fixed words, spaces, and the integer.
+    assert re.fullmatch(r"[A-Za-z ]+\d+[A-Za-z ]+", message)
+
+    await publisher.aclose(drain_timeout=0.2)
+
+
+@pytest.mark.asyncio
+async def test_unit_publisher_tracks_two_independent_streaks_separately(
+    server, caplog
+):
+    caplog.set_level(logging.DEBUG)
+
+    class ControllableClient:
+        def __init__(self):
+            self.mode = "fail"
+            self.calls = []
+
+        async def publish(self, topic, **kwargs):
+            if self.mode == "fail":
+                raise aiomqtt.MqttError("boom")
+            self.calls.append((topic, kwargs))
+
+    client = ControllableClient()
+    sleep_calls = []
+    publisher = server.UnitStatePublisher(client, sleep=_yielding_fake_sleep(sleep_calls))
+    await publisher.start()
+
+    publisher.submit(make_unit("unit-a"))
+    await wait_until(lambda: len(sleep_calls) >= 4)
+    client.mode = "ok"
+    await wait_until(lambda: len(client.calls) == 1)
+
+    # A second, wholly independent streak.
+    client.mode = "fail"
+    publisher.submit(make_unit("unit-b"))
+    await wait_until(lambda: len(sleep_calls) >= 9)
+    client.mode = "ok"
+    await wait_until(lambda: len(client.calls) == 2)
+
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    recoveries = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.INFO and "recovered" in r.getMessage()
+    ]
+    assert len(warnings) == 2
+    assert len(recoveries) == 2
+    # Two independent streaks -> two different failure counts.
+    assert recoveries[0].getMessage() != recoveries[1].getMessage()
+
+    await publisher.aclose(drain_timeout=0.2)
+
+
+@pytest.mark.asyncio
+async def test_unit_publisher_worker_cancellation_mid_streak_emits_no_recovery(
+    server, caplog
+):
+    caplog.set_level(logging.INFO)
+    sleep_calls = []
+
+    class AlwaysFailingClient:
+        async def publish(self, topic, **kwargs):
+            raise aiomqtt.MqttError("boom")
+
+    client = AlwaysFailingClient()
+    publisher = server.UnitStatePublisher(client, sleep=_yielding_fake_sleep(sleep_calls))
+    await publisher.start()
+    baseline_tasks = asyncio.all_tasks()
+
+    publisher.submit(make_unit("unit-a"))
+    await wait_until(lambda: len(sleep_calls) >= 3)
+
+    worker_task = publisher._worker_task  # noqa: SLF001
+    worker_task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await worker_task
+
+    recoveries = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.INFO and "recovered" in r.getMessage()
+    ]
+    assert recoveries == []
+    assert asyncio.all_tasks() - baseline_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_unit_publisher_aclose_mid_streak_emits_no_recovery(server, caplog):
+    caplog.set_level(logging.INFO)
+    sleep_calls = []
+
+    class AlwaysFailingClient:
+        async def publish(self, topic, **kwargs):
+            raise aiomqtt.MqttError("boom")
+
+    client = AlwaysFailingClient()
+    publisher = server.UnitStatePublisher(client, sleep=_yielding_fake_sleep(sleep_calls))
+    await publisher.start()
+    baseline_tasks = asyncio.all_tasks()
+
+    publisher.submit(make_unit("unit-a"))
+    await wait_until(lambda: len(sleep_calls) >= 3)
+
+    await publisher.aclose(drain_timeout=0.05)
+
+    recoveries = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.INFO and "recovered" in r.getMessage()
+    ]
+    assert recoveries == []
+    assert asyncio.all_tasks() - baseline_tasks == set()
+
+
+@pytest.mark.asyncio
+async def test_ble_disconnect_mid_publish_streak_emits_no_recovery_line(
+    server, caplog, monkeypatch
+):
+    """
+    A BLE disconnect tearing down the session while a unit-publish failure
+    streak is active must not emit a false recovery line, must still
+    propagate CasambiDisconnected (the exit-code-75 path is exercised
+    elsewhere; this only needs to prove it is not masked here), and must
+    not leak the publisher's worker task. PUBLISH_RETRY_SECONDS is
+    monkeypatched to a tiny real value purely so the (permanently failing)
+    streak produces its one warning quickly; the actual synchronization is
+    the unbounded `await bridge_task`, not a fixed poll budget racing real
+    time.
+    """
+    monkeypatch.setattr(server, "PUBLISH_RETRY_SECONDS", 0.001)
+    caplog.set_level(logging.INFO)
+    casa = DisconnectCasa()
+    disconnected = asyncio.Event()
+
+    class AlwaysFailingUnitPublishClient(BridgeMqttClient):
+        async def publish(self, topic, **kwargs):
+            if "events/unit-a" in topic:
+                raise aiomqtt.MqttError("boom")
+            await super().publish(topic, **kwargs)
+
+    client = AlwaysFailingUnitPublishClient(BlockingMessageStream())
+    baseline_tasks = asyncio.all_tasks()
+
+    bridge_task = asyncio.create_task(
+        server.run_connected_bridge(casa, client, disconnected)
+    )
+    await wait_for_registration(casa)
+
+    casa._unit_cb(make_unit("unit-a", dimmer=1))
+
+    for _ in range(500):
+        if any(r.levelno == logging.WARNING for r in caplog.records):
+            break
+        await asyncio.sleep(0)
+    else:
+        pytest.fail("failure streak never started")
+
+    disconnected.set()
+
+    with pytest.raises(server.CasambiDisconnected):
+        await bridge_task
+
+    recoveries = [
+        r
+        for r in caplog.records
+        if r.levelno == logging.INFO and "recovered" in r.getMessage()
+    ]
+    assert recoveries == []
+    assert asyncio.all_tasks() - baseline_tasks == set()
+
+
 @pytest.mark.asyncio
 async def test_switch_publisher_drops_and_warns_once_when_queue_full(server, caplog):
     caplog.set_level(logging.WARNING)
@@ -993,6 +1237,34 @@ async def test_bridge_owned_and_redacted_logging_never_leaks_private_data(
         for i in range(server.SWITCH_EVENT_QUEUE_MAX + 3):
             switch_publisher(make_switch_event(button=i))
 
+        # (c) round 3: the failure-streak warning and its recovery summary
+        # must never carry the fake unit's data either -- fail once, then
+        # succeed, against the SAME fake-marked unit used above.
+        class FailOnceThenOkClient:
+            def __init__(self):
+                self.should_fail = True
+
+            async def publish(self, topic, **kwargs):
+                if self.should_fail:
+                    self.should_fail = False
+                    raise aiomqtt.MqttError("boom")
+
+        streak_client = FailOnceThenOkClient()
+        streak_publisher = server.UnitStatePublisher(
+            streak_client, sleep=_yielding_fake_sleep([])
+        )
+        await streak_publisher.start()
+        streak_publisher.submit(
+            make_unit(fake_mac, name=fake_unit_name, uuid=fake_uuid, dimmer=42)
+        )
+        await wait_until(
+            lambda: any(
+                r.levelno == logging.INFO and "recovered" in r.getMessage()
+                for r in caplog.records
+            )
+        )
+        await streak_publisher.aclose(drain_timeout=0.2)
+
         diagnostics = server.BridgeDiagnostics()
         unit_publisher = server.UnitStatePublisher(client)
 
@@ -1002,6 +1274,7 @@ async def test_bridge_owned_and_redacted_logging_never_leaks_private_data(
         blobs.append(str(server.CasambiDisconnected()))
         blobs.append(repr(switch_publisher))
         blobs.append(repr(unit_publisher))
+        blobs.append(repr(streak_publisher))
         blobs.append(repr(diagnostics))
         blobs.append(str(diagnostics))
 
