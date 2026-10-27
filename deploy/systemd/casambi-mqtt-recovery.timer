@@ -1,0 +1,10 @@
+[Unit]
+Description=Periodic check of the Casambi MQTT bridge health record
+
+[Timer]
+OnBootSec=3min
+OnUnitInactiveSec=1min
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target

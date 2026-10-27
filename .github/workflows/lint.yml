@@ -26,10 +26,10 @@ jobs:
           run: python3 -m pip install -r requirements-server.txt -r requirements-dev.txt
 
         - name: "Run bridge unit tests"
-          run: pytest -q tests/test_server.py tests/test_switch_decoder.py tests/test_bridge_lifecycle.py tests/test_bridge_health.py
+          run: pytest -q tests/test_server.py tests/test_switch_decoder.py tests/test_bridge_lifecycle.py tests/test_bridge_health.py tests/test_bridge_startup.py tests/test_bridge_recovery.py
 
         - name: "Syntax check"
-          run: python3 -m py_compile server.py
+          run: python3 -m py_compile server.py scripts/bridge_recovery.py
 
         - name: "Lint"
           run: python3 -m ruff check .
