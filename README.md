@@ -9,7 +9,8 @@ A local-push Home Assistant integration for Casambi networks. A separate Bluetoo
 ### Unreleased
 
 - Adds the versioned, non-actuating bridge health protocol v1 (`casambi/<network>/status`, `casambi/<network>/health/reply`, `GET_STATUS`, and a correlated `PUBLISH_ENTITIES` snapshot). See [docs/health-protocol.md](docs/health-protocol.md) for topics, minimum ACLs, what it does and does not prove, and rollback.
-- The Home Assistant component observes bridge freshness and whether its own unit consumer still handles messages, and reports it in the config entry's diagnostics. It takes no recovery action yet.
+- The Home Assistant component observes bridge freshness and whether its own unit consumer still handles messages. A diagnostic **Casambi health** sensor shows the entry's state, and the entry reloads only itself when its updates are proven stuck. See **Consumer health and automatic recovery** below.
+- Fixes an error raised on every state update of a user-disabled Casambi light or scene entity.
 - The bridge maps SIGTERM to a clean shutdown and registers a retained `offline` last will. Existing topics, payloads, commands and entity identities are unchanged.
 
 ### 0.2.9
@@ -159,6 +160,37 @@ event is emitted as one JSON object containing only `event`, `button`, and
 
 Some Casambi units do not expose a usable Bluetooth address. For those units, the bridge uses their stable UUID only for MQTT and Home Assistant identity (`events/uuid/<uuid>`). The original Casambi address is retained in the control path. Do not manually create retained payloads on the legacy bare `events/` topic.
 
+## Consumer health and automatic recovery
+
+Each Casambi MQTT config entry watches its own processing of unit messages (see [docs/health-protocol.md](docs/health-protocol.md)). Its diagnostic **Casambi health** sensor shows one of these states:
+
+| State | Meaning | Automatic action |
+|---|---|---|
+| `starting` | startup grace (90 s), entity platforms not ready yet, or no live bridge status yet | none |
+| `healthy` | the last correlated snapshot probe was handled by this entry's real light callback | none |
+| `bridge_unavailable` | no fresh bridge status, `offline`, or the bridge reports `degraded` (e.g. BLE lost); the reason is in the `reason` attribute | none: an external outage is never "fixed" by reloading |
+| `consumer_stale` | the bridge confirmed a snapshot and the messages reached Home Assistant, but this entry handled **none** of them | after a second proof at least 90 s later: reload this entry |
+| `recovering` | a reload of this entry is running and being verified | — |
+| `recovery_failed` | the reload budget is spent or a reload could not be verified | none until acknowledged |
+| `unsupported` | the bridge does not answer the health protocol (older bridge) | none; a repair notice explains the update |
+
+How recovery works:
+
+- Only `hass.config_entries.async_reload(<this entry>)` is used. It never restarts Home Assistant, never touches another entry or the bridge host, and never sends a light or scene command.
+- At most one reload runs at a time. Reloads are at least 10 minutes apart and limited to two per 30 minutes.
+- The budget and the latch are kept outside the entry, in a per-entry store, so the entry's own reload or a Home Assistant restart does not reset them.
+- A reload counts as successful only if the entry is loaded again, a **new** consumer probe succeeds, and every previously present light entity is available again. A fresh `unavailable` state does not count.
+- When the limit is reached, one repair issue is raised (updated, never repeated). Its fix flow re-enables automatic recovery after you have looked at the problem.
+- A later healthy probe clears it and shows a "recovered" notification.
+
+Settings live in the integration's options: the probe intervals, stale and grace times, the reload cooldown, the confirmation interval and the verification time. To disable automatic reloads, untick **Reload this entry automatically when its updates are stuck**; detection and the sensor keep working.
+
+Known limits:
+
+- The root cause of the 27.10.2026 incident, where entities stayed stale until the entry was reloaded, has **not** been identified. This recovery works around it and does not fix it.
+- Detection runs on the consumer-probe interval (default 15 minutes), so a stuck consumer can go unnoticed that long.
+- Rollback: install the previous release. The stored recovery state (`.storage/casambi_mqtt.<entry_id>.recovery`) is ignored by older versions and removed when the entry is deleted.
+
 ## Development
 
 ### Bridge tests
@@ -176,7 +208,7 @@ The component test environment is intentionally separate from the bridge depende
 uv venv --python 3.13 .venv-ha-test
 . .venv-ha-test/bin/activate
 python -m pip install -r requirements-test.txt
-pytest -q tests/test_light.py tests/test_integration.py tests/test_migration.py tests/test_switch_events.py tests/test_device_trigger_discovery.py tests/test_target_trigger_discovery.py tests/test_health.py -o asyncio_mode=auto
+pytest -q tests/test_light.py tests/test_integration.py tests/test_migration.py tests/test_switch_events.py tests/test_device_trigger_discovery.py tests/test_target_trigger_discovery.py tests/test_health.py tests/test_recovery.py -o asyncio_mode=auto
 ```
 
 CI runs bridge tests, component tests, Ruff, Hassfest, and HACS validation on every pull request.

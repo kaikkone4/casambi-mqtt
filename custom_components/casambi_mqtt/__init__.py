@@ -25,6 +25,11 @@ from .event import async_add_switch_buttons
 from .health import HealthObserver, HealthSettings
 from .health_monitor import HealthMonitor
 from .light import CasambiMqttLight
+from .recovery import (
+    HealthCoordinator,
+    async_get_recovery_manager,
+    async_remove_recovery_manager,
+)
 from .runtime_data import CasambiMqttRuntimeData
 from .scene import CasambiMqttScene
 from .switch_events import MAX_SWITCH_VALUE, decode_switch_event
@@ -34,6 +39,7 @@ PLATFORMS: list[Platform] = [
     Platform.BUTTON,
     Platform.SCENE,
     Platform.EVENT,
+    Platform.SENSOR,
 ]
 LEGACY_ADDRESSLESS_LIGHT_UNIQUE_ID = "casambi_mqtt_light_"
 CONFIG_ENTRY_VERSION = 2
@@ -246,15 +252,35 @@ async def async_setup_entry(  # noqa: PLR0915
     )
     entry.runtime_data.switch_store = switch_store
     _restore_switch_buttons(hass, entry, await switch_store.async_load())
+    event_prefix = f"{MQTT_TOPIC_PREFIX}/{network_name}/events/"
+    # Health objects exist before the platforms are set up, so the sensor
+    # platform finds its coordinator.
+    settings = HealthSettings.from_options(entry.options)
+    health = HealthObserver(settings, event_prefix)
+    entry.runtime_data.health = health
+    health_monitor = HealthMonitor(hass, entry, network_name, health)
+    runtime = entry.runtime_data
+    health.consumer_ready = lambda: (
+        runtime.light_add_entities is not None
+        and runtime.scene_add_entities is not None
+    )
+    coordinator = HealthCoordinator(
+        hass,
+        entry.entry_id,
+        health,
+        await async_get_recovery_manager(hass, entry.entry_id),
+        settings,
+        health_monitor.request_probe,
+    )
+    runtime.health_coordinator = coordinator
+    runtime.health_monitor = health_monitor
+    health_monitor.on_tick = coordinator.async_update
+    entry.async_on_unload(coordinator.async_shutdown)
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
     _remove_legacy_addressless_light(hass, entry)
 
-    event_prefix = f"{MQTT_TOPIC_PREFIX}/{network_name}/events/"
     scene_prefix = f"{MQTT_TOPIC_PREFIX}/{network_name}/scenes/"
     switch_event_topic = f"{MQTT_TOPIC_PREFIX}/{network_name}/switch_events"
-    health = HealthObserver(HealthSettings.from_options(entry.options), event_prefix)
-    entry.runtime_data.health = health
-    health_monitor = HealthMonitor(hass, entry, network_name, health)
 
     async def event_processor(  # noqa: PLR0911, PLR0912
         msg: ReceiveMessage,
@@ -391,6 +417,11 @@ async def async_setup_entry(  # noqa: PLR0915
 
 async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
     await hass.config_entries.async_reload(entry.entry_id)
+
+
+async def async_remove_entry(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    """Drop this entry's recovery budget, latch and repair issues."""
+    await async_remove_recovery_manager(hass, entry.entry_id)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

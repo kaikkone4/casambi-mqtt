@@ -37,6 +37,7 @@ class HealthMonitor:
         self.status_topic = hp.status_topic(MQTT_TOPIC_PREFIX, network_name)
         self.reply_topic = hp.reply_topic(MQTT_TOPIC_PREFIX, network_name)
         self.command_topic = f"{MQTT_TOPIC_PREFIX}/{network_name}/commands"
+        self.on_tick: Callable[[], None] | None = None
 
     async def async_subscribe(
         self,
@@ -90,7 +91,17 @@ class HealthMonitor:
 
     @callback
     def _on_tick(self, _now: object = None) -> None:
-        probe = self.observer.tick()
+        self._send(self.observer.tick())
+        if self.on_tick is not None:
+            self.on_tick()
+
+    @callback
+    def request_probe(self, kind: ProbeKind) -> None:
+        """Start a probe now if none is pending (used to verify a recovery)."""
+        self._send(self.observer.start_probe(kind))
+
+    @callback
+    def _send(self, probe: PendingProbe | None) -> None:
         if probe is not None:
             self.entry.async_create_background_task(
                 self.hass, self._async_send(probe), "casambi_mqtt health probe"

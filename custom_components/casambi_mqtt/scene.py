@@ -40,7 +40,10 @@ class CasambiMqttScene(HAScene):
 
     def update_entity(self, scene: Scene) -> None:
         self._attr_name = scene.name
-        self.async_write_ha_state()
+        # A user-disabled entity is never added to Home Assistant (no hass,
+        # no entity_id); writing its state would raise on every update.
+        if self.hass is not None and self.entity_id is not None:
+            self.async_write_ha_state()
 
     async def async_activate(self, **kwargs: Any) -> None:
         command = SetScene(self._attr_casambi_id)

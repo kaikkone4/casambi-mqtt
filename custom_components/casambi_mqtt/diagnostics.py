@@ -13,5 +13,10 @@ async def async_get_config_entry_diagnostics(
     hass: HomeAssistant, entry: ConfigEntry
 ) -> dict[str, Any]:
     """Return no network name, topic, unit, request ID or payload."""
-    health = getattr(getattr(entry, "runtime_data", None), "health", None)
-    return {"health": None if health is None else health.diagnostics()}
+    runtime = getattr(entry, "runtime_data", None)
+    health = getattr(runtime, "health", None)
+    coordinator = getattr(runtime, "health_coordinator", None)
+    return {
+        "health": None if health is None else health.diagnostics(),
+        "consumer": None if coordinator is None else coordinator.diagnostics(),
+    }

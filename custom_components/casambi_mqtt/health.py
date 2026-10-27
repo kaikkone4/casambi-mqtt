@@ -41,6 +41,13 @@ CONF_STARTUP_GRACE_SECONDS = "health_startup_grace_seconds"
 CONF_PROBE_INTERVAL_SECONDS = "health_probe_interval_seconds"
 CONF_CONSUMER_PROBE_INTERVAL_SECONDS = "health_consumer_probe_interval_seconds"
 CONF_PROBE_DEADLINE_SECONDS = "health_probe_deadline_seconds"
+CONF_RECOVERY_ENABLED = "health_recovery_enabled"
+CONF_RECOVERY_COOLDOWN_SECONDS = "health_recovery_cooldown_seconds"
+CONF_STALE_CONFIRM_SECONDS = "health_stale_confirm_seconds"
+CONF_RECOVERY_VERIFY_SECONDS = "health_recovery_verify_seconds"
+DEFAULT_RECOVERY_COOLDOWN_SECONDS = 600
+DEFAULT_STALE_CONFIRM_SECONDS = 90
+DEFAULT_RECOVERY_VERIFY_SECONDS = 180
 
 # (default, minimum, maximum) for every validated setting.
 SETTING_RANGES: dict[str, tuple[int, int, int]] = {
@@ -57,6 +64,9 @@ SETTING_RANGES: dict[str, tuple[int, int, int]] = {
         86400,
     ),
     CONF_PROBE_DEADLINE_SECONDS: (DEFAULT_PROBE_DEADLINE_SECONDS, 5, 120),
+    CONF_RECOVERY_COOLDOWN_SECONDS: (DEFAULT_RECOVERY_COOLDOWN_SECONDS, 600, 86400),
+    CONF_STALE_CONFIRM_SECONDS: (DEFAULT_STALE_CONFIRM_SECONDS, 90, 3600),
+    CONF_RECOVERY_VERIFY_SECONDS: (DEFAULT_RECOVERY_VERIFY_SECONDS, 60, 900),
 }
 
 
@@ -67,6 +77,10 @@ class HealthSettings:
     probe_interval_seconds: int = DEFAULT_PROBE_INTERVAL_SECONDS
     consumer_probe_interval_seconds: int = DEFAULT_CONSUMER_PROBE_INTERVAL_SECONDS
     probe_deadline_seconds: int = DEFAULT_PROBE_DEADLINE_SECONDS
+    recovery_cooldown_seconds: int = DEFAULT_RECOVERY_COOLDOWN_SECONDS
+    stale_confirm_seconds: int = DEFAULT_STALE_CONFIRM_SECONDS
+    recovery_verify_seconds: int = DEFAULT_RECOVERY_VERIFY_SECONDS
+    recovery_enabled: bool = True
 
     @classmethod
     def from_options(cls, options: Mapping[str, Any]) -> HealthSettings:
@@ -81,7 +95,10 @@ class HealthSettings:
             ):
                 value = default
             values[key.removeprefix("health_")] = value
-        return cls(**values)
+        enabled = options.get(CONF_RECOVERY_ENABLED, True)
+        return cls(
+            **values, recovery_enabled=enabled if isinstance(enabled, bool) else True
+        )
 
 
 class BridgeState(StrEnum):
@@ -383,6 +400,9 @@ class HealthObserver:
         self.last_result: dict[ProbeKind, ProbeResult] = {}
         self.last_ok: dict[ProbeKind, float] = {}
         self.listeners: list[Callable[[ProbeResult], None]] = []
+        # The consumer can only be judged once the entity platforms have
+        # registered their add-entities callbacks (set by the wiring).
+        self.consumer_ready: Callable[[], bool] = lambda: True
         self._next_due: dict[ProbeKind, float] = {
             ProbeKind.STATUS: self.started_at + settings.startup_grace_seconds,
             ProbeKind.CONSUMER: self.started_at + settings.startup_grace_seconds,
@@ -441,13 +461,17 @@ class HealthObserver:
         for kind in sorted(self._next_due, key=self._next_due.__getitem__):
             if now < self._next_due[kind]:
                 continue
-            if (
-                kind is ProbeKind.CONSUMER
-                and self.bridge.evaluate(now) is not BridgeState.HEALTHY
+            if kind is ProbeKind.CONSUMER and (
+                self.bridge.evaluate(now) is not BridgeState.HEALTHY
+                or not self.consumer_ready()
             ):
                 continue
             return self.start_probe(kind)
         return None
+
+    def schedule(self, kind: ProbeKind, delay: float) -> None:
+        """Make the next probe of ``kind`` due after ``delay`` seconds."""
+        self._next_due[kind] = self.now() + delay
 
     def start_probe(self, kind: ProbeKind) -> PendingProbe | None:
         now = self.now()

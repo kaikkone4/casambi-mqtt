@@ -9,7 +9,9 @@ if TYPE_CHECKING:
     from homeassistant.helpers.storage import Store
 
     from .health import HealthObserver
+    from .health_monitor import HealthMonitor
     from .light import CasambiMqttLight
+    from .recovery import HealthCoordinator
     from .scene import CasambiMqttScene
 
 SWITCH_EVENT_DEDUP_SECONDS = 0.25
@@ -30,6 +32,8 @@ class CasambiMqttRuntimeData:
     last_switch_events: dict[tuple[int, int, str], float] = field(default_factory=dict)
     switch_store: Store | None = None
     health: HealthObserver | None = None
+    health_coordinator: HealthCoordinator | None = None
+    health_monitor: HealthMonitor | None = None
 
     def is_duplicate_switch_event(self, event_key: tuple[int, int, str]) -> bool:
         """Collapse an identical QoS retry burst, but not distinct event phases."""
