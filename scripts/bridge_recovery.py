@@ -8,15 +8,20 @@ imports code the unprivileged bridge user can modify.
 
 What it does, and nothing else:
 
-* reads the bridge's local health record as UNTRUSTED input;
-* counts confirmed, repeated BLE startup failures of distinct bridge
-  processes in a root-owned state file that survives bridge restarts;
-* when they repeat and the budget allows: stop the bridge, wait until its
-  process is gone, restart ``bluetooth.service``, start the bridge, and
+* counts bridge exits with the BLE startup exit status (76) from systemd's
+  own bookkeeping (``NRestarts``, ``ExecMainStatus``) -- trusted data the
+  unprivileged bridge cannot forge -- in root-owned state that survives
+  bridge restarts;
+* reads the bridge's local health record only as UNTRUSTED, advisory input,
+  and only when it belongs to the unit's current main process;
+* when BLE failures repeat and the budget allows: stop the bridge, wait until
+  it is fully stopped, restart ``bluetooth.service``, start the bridge, and
   verify that a NEW bridge process reaches ``ready``;
+* when the bridge gave up for any other non-configuration reason: a
+  separately budgeted plain restart of the bridge only;
 * after the budget is spent, or when any step fails: latch
   ``recovery_failed``, log one critical line, and do nothing further until a
-  verified healthy period or an operator ``reset``.
+  long healthy period it observed itself, or an operator ``reset``.
 
 It never touches any unit other than the configured bridge unit and
 ``bluetooth.service``, never runs a shell, never reboots, and never reacts to
@@ -31,12 +36,13 @@ import fcntl
 import json
 import os
 import re
+import stat
 import subprocess
 import sys
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from collections.abc import Callable, Iterator, Mapping
@@ -53,6 +59,22 @@ STATE_VERSION = 1
 RECORD_VERSION = 1
 MAX_RECORD_BYTES = 4096
 MAX_SEEN_INSTANCES = 32
+EXIT_BLE_STARTUP_FAILED = 76
+EXIT_CONFIGURATION = 78
+# A live bridge whose record has not changed for this long while it is still
+# discovering/connecting is stuck (it should have exited within ~3 minutes).
+STUCK_SECONDS = 600
+PLAIN_RESTART_WINDOW_SECONDS = 1800
+MAX_PLAIN_RESTARTS_PER_WINDOW = 1
+UNIT_PROPERTIES = (
+    "ActiveState",
+    "SubState",
+    "MainPID",
+    "Result",
+    "ExecMainStatus",
+    "ExecMainPID",
+    "NRestarts",
+)
 
 # Startup failures that a Bluetooth stack reset can plausibly fix.
 BLE_STARTUP_ERRORS = frozenset(
@@ -184,6 +206,7 @@ class RecordView:
     ready_since: float | None
     updated: float
     alive: bool
+    mqtt_reconnects: int = 0
 
 
 def _is_int(value: object, minimum: int = 0) -> bool:
@@ -223,7 +246,7 @@ def parse_record(
 
     A record from another boot is ignored entirely. A record whose PID is gone
     or now belongs to a different process (start time mismatch) describes a
-    process that has exited: it is ``alive=False`` and can never be healthy.
+    process that has exited: it is ``alive=False``.
     """
     if len(raw) > MAX_RECORD_BYTES:
         return None
@@ -238,6 +261,7 @@ def parse_record(
     start_ticks = data.get("start_ticks")
     record_boot = data.get("boot_id")
     ready_since = data.get("ready_since_monotonic")
+    mqtt_reconnects = data.get("mqtt_reconnects", 0)
     if (
         not isinstance(instance_id, str)
         or INSTANCE_ID.fullmatch(instance_id) is None
@@ -252,6 +276,7 @@ def parse_record(
         or not isinstance(data.get("ever_ready"), bool)
         or not (ready_since is None or _is_number(ready_since))
         or not _is_number(data.get("updated_monotonic"))
+        or not _is_int(mqtt_reconnects)
     ):
         return None
     if boot_id is None or record_boot != boot_id:
@@ -265,14 +290,36 @@ def parse_record(
         ready_since=ready_since,
         updated=data["updated_monotonic"],
         alive=start_ticks_of(pid) == start_ticks,
+        mqtt_reconnects=mqtt_reconnects,
     )
 
 
-def load_record(settings: Settings) -> RecordView | None:
+def read_record_bytes(path: Path) -> bytes | None:
+    """
+    Read the record without following links or blocking.
+
+    The record's directory belongs to the unprivileged bridge user, so the
+    file may be swapped for a symlink (O_NOFOLLOW refuses it) or a FIFO
+    (O_NONBLOCK keeps open() from hanging; fstat then rejects it).
+    """
+    flags = os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC
     try:
-        with settings.health_record.open("rb") as handle:
-            raw = handle.read(MAX_RECORD_BYTES + 1)
+        descriptor = os.open(path, flags)
     except OSError:
+        return None
+    try:
+        if not stat.S_ISREG(os.fstat(descriptor).st_mode):
+            return None
+        return os.read(descriptor, MAX_RECORD_BYTES + 1)
+    except OSError:
+        return None
+    finally:
+        os.close(descriptor)
+
+
+def load_record(settings: Settings) -> RecordView | None:
+    raw = read_record_bytes(settings.health_record)
+    if raw is None:
         return None
     return parse_record(
         raw,
@@ -282,16 +329,100 @@ def load_record(settings: Settings) -> RecordView | None:
 
 
 # ---------------------------------------------------------------------------
+# Trusted unit state from systemd
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class UnitView:
+    active_state: str
+    main_pid: int
+    result: str
+    exec_main_status: int | None
+    exec_main_pid: int
+    n_restarts: int
+
+    @classmethod
+    def from_properties(cls, properties: Mapping[str, str]) -> UnitView:
+        def integer(key: str) -> int | None:
+            try:
+                return int(properties.get(key, ""))
+            except ValueError:
+                return None
+
+        return cls(
+            active_state=properties.get("ActiveState", "unknown"),
+            main_pid=integer("MainPID") or 0,
+            result=properties.get("Result", "unknown"),
+            exec_main_status=integer("ExecMainStatus"),
+            exec_main_pid=integer("ExecMainPID") or 0,
+            n_restarts=integer("NRestarts") or 0,
+        )
+
+
+# ---------------------------------------------------------------------------
+# Clock: budgets use boot-scoped CLOCK_BOOTTIME, never the wall clock alone
+# ---------------------------------------------------------------------------
+
+
+def _boottime() -> float:
+    return time.clock_gettime(time.CLOCK_BOOTTIME)
+
+
+@dataclass
+class Clock:
+    wall: Callable[[], float] = time.time
+    monotonic: Callable[[], float] = time.monotonic
+    sleep: Callable[[float], None] = time.sleep
+    boottime: Callable[[], float] = _boottime
+    boot_id: Callable[[], str | None] = lambda: read_text(
+        "/proc/sys/kernel/random/boot_id"
+    )
+
+    def stamp(self) -> dict[str, Any]:
+        return {"boot": self.boot_id(), "t": self.boottime(), "wall": self.wall()}
+
+
+def _is_stamp(value: object) -> bool:
+    return (
+        isinstance(value, dict)
+        and set(value) == {"boot", "t", "wall"}
+        and (value["boot"] is None or isinstance(value["boot"], str))
+        and _is_number(value["t"])
+        and _is_number(value["wall"])
+    )
+
+
+def is_recent(stamp: Mapping[str, Any], clock: Clock, window: float) -> bool:
+    """
+    Whether ``stamp`` lies within ``window`` seconds of now.
+
+    Within one boot this uses CLOCK_BOOTTIME, which no NTP step can move. For
+    a stamp from an earlier boot only the wall clock is left; it is used
+    conservatively -- a stamp that looks to be in the future still counts.
+    """
+    boot = clock.boot_id()
+    if boot is not None and stamp["boot"] == boot:
+        return clock.boottime() - stamp["t"] < window
+    return clock.wall() - stamp["wall"] < window
+
+
+# ---------------------------------------------------------------------------
 # Root-owned state
 # ---------------------------------------------------------------------------
 
 
 @dataclass
 class State:
-    ble_failures: list[float] = field(default_factory=list)
-    seen_instances: list[str] = field(default_factory=list)
-    resets: list[float] = field(default_factory=list)
-    mqtt_failures: int = 0
+    ble_failures: list[dict[str, Any]] = field(default_factory=list)
+    resets: list[dict[str, Any]] = field(default_factory=list)
+    plain_restarts: list[dict[str, Any]] = field(default_factory=list)
+    last_n_restarts: int = 0
+    counted_terminal: str = ""
+    ready_instance: str = ""
+    ready_since: dict[str, Any] | None = None
+    stuck_counted: list[str] = field(default_factory=list)
+    mqtt_reconnects: int = 0
     recovery_failed: bool = False
     reason: str = "none"
     last_result: str = "none"
@@ -300,41 +431,46 @@ class State:
         return json.dumps({"version": STATE_VERSION, **asdict(self)}, indent=1)
 
 
-def _number_list(value: object) -> list[float] | None:
-    if not isinstance(value, list) or not all(_is_number(item) for item in value):
-        return None
-    return [float(item) for item in value]
-
-
 def parse_state(raw: str) -> State:
     """Load state; a corrupt file fails closed as ``recovery_failed``."""
+    unreadable = State(recovery_failed=True, reason="state_unreadable")
     try:
         data = json.loads(raw)
     except ValueError:
-        data = None
+        return unreadable
     if not isinstance(data, dict) or data.get("version") != STATE_VERSION:
-        return State(recovery_failed=True, reason="state_unreadable")
-    failures = _number_list(data.get("ble_failures"))
-    resets = _number_list(data.get("resets"))
-    seen = data.get("seen_instances")
+        return unreadable
+    stamps = {}
+    for key in ("ble_failures", "resets", "plain_restarts"):
+        value = data.get(key)
+        if not isinstance(value, list) or not all(_is_stamp(item) for item in value):
+            return unreadable
+        stamps[key] = value
+    ready_since = data.get("ready_since")
+    stuck = data.get("stuck_counted")
     if (
-        failures is None
-        or resets is None
-        or not isinstance(seen, list)
+        not _is_int(data.get("last_n_restarts"))
+        or not isinstance(data.get("counted_terminal"), str)
+        or not isinstance(data.get("ready_instance"), str)
+        or not (ready_since is None or _is_stamp(ready_since))
+        or not isinstance(stuck, list)
         or not all(
-            isinstance(item, str) and INSTANCE_ID.fullmatch(item) for item in seen
+            isinstance(item, str) and INSTANCE_ID.fullmatch(item) for item in stuck
         )
-        or not _is_int(data.get("mqtt_failures"))
+        or not _is_int(data.get("mqtt_reconnects"))
         or not isinstance(data.get("recovery_failed"), bool)
         or not isinstance(data.get("reason"), str)
         or not isinstance(data.get("last_result"), str)
     ):
-        return State(recovery_failed=True, reason="state_unreadable")
+        return unreadable
     return State(
-        ble_failures=failures,
-        seen_instances=seen[-MAX_SEEN_INSTANCES:],
-        resets=resets,
-        mqtt_failures=data["mqtt_failures"],
+        **stamps,
+        last_n_restarts=data["last_n_restarts"],
+        counted_terminal=data["counted_terminal"][:64],
+        ready_instance=data["ready_instance"][:32],
+        ready_since=ready_since,
+        stuck_counted=stuck[-MAX_SEEN_INSTANCES:],
+        mqtt_reconnects=data["mqtt_reconnects"],
         recovery_failed=data["recovery_failed"],
         reason=data["reason"][:64],
         last_result=data["last_result"][:64],
@@ -381,11 +517,12 @@ def exclusive_lock(settings: Settings) -> Iterator[bool]:
 
 
 # ---------------------------------------------------------------------------
-# Decision: pure functions over state and record
+# Decision: pure functions over state, unit and record
 # ---------------------------------------------------------------------------
 
 ACTION_NONE = "none"
 ACTION_RECOVER = "recover"
+ACTION_RESTART = "restart_bridge"
 ACTION_LATCH = "latch_failed"
 
 
@@ -395,62 +532,103 @@ class Decision:
     reason: str
 
 
-def _recent(values: list[float], now: float, window: float) -> list[float]:
-    # A timestamp "in the future" (wall clock stepped back) stays counted:
-    # the budget may only ever be too strict, never too lenient.
-    return [value for value in values if now - value < window]
+def trusted_record(record: RecordView | None, unit: UnitView) -> RecordView | None:
+    """Return the record only if it is the unit's current, live main process."""
+    if record is None or not record.alive or record.pid != unit.main_pid:
+        return None
+    return record
+
+
+def _recent(stamps: list[dict[str, Any]], clock: Clock, window: float) -> list:
+    return [stamp for stamp in stamps if is_recent(stamp, clock, window)]
 
 
 def observe(
-    state: State, record: RecordView | None, now: float, now_mono: float, s: Settings
+    state: State,
+    unit: UnitView,
+    record: RecordView | None,
+    clock: Clock,
+    s: Settings,
 ) -> None:
-    """Fold one record observation into the state."""
-    state.ble_failures = _recent(state.ble_failures, now, s.failure_window)
-    state.resets = _recent(state.resets, now, s.long_window)
+    """Fold one observation of systemd and the record into the state."""
+    state.ble_failures = _recent(state.ble_failures, clock, s.failure_window)
+    state.resets = _recent(state.resets, clock, s.long_window)
+    state.plain_restarts = _recent(
+        state.plain_restarts, clock, PLAIN_RESTART_WINDOW_SECONDS
+    )
+
+    # Exits since the last run, from systemd's own counters. NRestarts only
+    # grows with automatic restarts and starts over after an explicit start.
+    previous = state.last_n_restarts if unit.n_restarts >= state.last_n_restarts else 0
+    new_exits = unit.n_restarts - previous
+    state.last_n_restarts = unit.n_restarts
+    if unit.active_state == "failed":
+        # The final exit before systemd gave up is not an automatic restart.
+        terminal = f"{unit.exec_main_pid}:{unit.n_restarts}"
+        if state.counted_terminal != terminal:
+            state.counted_terminal = terminal
+            new_exits += 1
+    if new_exits and unit.exec_main_status == EXIT_BLE_STARTUP_FAILED:
+        # Only the newest exit status is known; count at most what can matter.
+        for _ in range(min(new_exits, s.failures_to_reset)):
+            state.ble_failures.append(clock.stamp())
+
+    record = trusted_record(record, unit)
     if record is None:
+        state.ready_instance = ""
+        state.ready_since = None
         return
-    if record.alive:
-        if (
-            record.phase == "ready"
-            and record.ready_since is not None
-            and now_mono - record.ready_since >= s.healthy_reset_seconds
-        ):
-            # Only a long, verified healthy period clears the counters and
-            # the latch -- never merely a new process starting.
+    state.mqtt_reconnects = record.mqtt_reconnects
+    if record.phase == "ready":
+        if state.ready_instance != record.instance_id or state.ready_since is None:
+            # The healthy period starts when THIS supervisor first sees it,
+            # never at a time the (untrusted) record claims.
+            state.ready_instance = record.instance_id
+            state.ready_since = clock.stamp()
+        elif not is_recent(state.ready_since, clock, s.healthy_reset_seconds):
             if state.ble_failures or state.recovery_failed:
-                log(5, "Bridge verified healthy; recovery counters cleared")
+                log(5, "Bridge observed healthy for a long period; counters cleared")
             state.ble_failures = []
             state.recovery_failed = False
             state.reason = "none"
         return
-    if record.instance_id in state.seen_instances:
-        return
-    state.seen_instances = [*state.seen_instances, record.instance_id][
-        -MAX_SEEN_INSTANCES:
-    ]
-    if record.error in BLE_STARTUP_ERRORS or (
-        record.error == "ble_disconnected" and not record.ever_ready
+    state.ready_instance = ""
+    state.ready_since = None
+    if (
+        record.phase in {"discovering", "connecting"}
+        and clock.monotonic() - record.updated > STUCK_SECONDS
+        and record.instance_id not in state.stuck_counted
     ):
-        state.ble_failures.append(now)
-    elif record.error == "mqtt_error":
-        state.mqtt_failures += 1
+        state.stuck_counted = [*state.stuck_counted, record.instance_id][
+            -MAX_SEEN_INSTANCES:
+        ]
+        state.ble_failures.append(clock.stamp())
 
 
-def decide(
-    state: State, record: RecordView | None, now: float, s: Settings
+def decide(  # noqa: PLR0911
+    state: State,
+    unit: UnitView,
+    record: RecordView | None,
+    clock: Clock,
+    s: Settings,
 ) -> Decision:
     if state.recovery_failed:
         return Decision(ACTION_NONE, "recovery_failed")
-    if len(state.ble_failures) < s.failures_to_reset:
-        return Decision(ACTION_NONE, "no_repeated_ble_failure")
-    if record is not None and record.alive and record.phase == "ready":
+    trusted = trusted_record(record, unit)
+    if trusted is not None and trusted.phase == "ready":
         return Decision(ACTION_NONE, "bridge_ready")
-    if (
-        len(_recent(state.resets, now, s.short_window)) >= s.max_resets_short
-        or len(_recent(state.resets, now, s.long_window)) >= s.max_resets_long
-    ):
-        return Decision(ACTION_LATCH, "budget_exhausted")
-    return Decision(ACTION_RECOVER, "repeated_ble_failure")
+    if len(state.ble_failures) >= s.failures_to_reset:
+        if (
+            len(_recent(state.resets, clock, s.short_window)) >= s.max_resets_short
+            or len(_recent(state.resets, clock, s.long_window)) >= s.max_resets_long
+        ):
+            return Decision(ACTION_LATCH, "budget_exhausted")
+        return Decision(ACTION_RECOVER, "repeated_ble_failure")
+    if unit.active_state == "failed" and unit.exec_main_status != EXIT_CONFIGURATION:
+        if len(state.plain_restarts) >= MAX_PLAIN_RESTARTS_PER_WINDOW:
+            return Decision(ACTION_NONE, "bridge_failed_restart_budget_used")
+        return Decision(ACTION_RESTART, "bridge_failed")
+    return Decision(ACTION_NONE, "no_repeated_ble_failure")
 
 
 # ---------------------------------------------------------------------------
@@ -513,7 +691,7 @@ class Systemctl:
                     self.executable,
                     "show",
                     unit,
-                    "--property=ActiveState,SubState,MainPID,Result",
+                    f"--property={','.join(UNIT_PROPERTIES)}",
                 ],
                 capture_output=True,
                 text=True,
@@ -527,21 +705,14 @@ class Systemctl:
         properties = {}
         for line in result.stdout.splitlines():
             key, _, value = line.partition("=")
-            if key in {"ActiveState", "SubState", "MainPID", "Result"}:
+            if key in UNIT_PROPERTIES:
                 properties[key] = value.strip()
         return properties
 
 
 # ---------------------------------------------------------------------------
-# Recovery
+# Actions
 # ---------------------------------------------------------------------------
-
-
-@dataclass
-class Clock:
-    wall: Callable[[], float] = time.time
-    monotonic: Callable[[], float] = time.monotonic
-    sleep: Callable[[float], None] = time.sleep
 
 
 def _wait_until(
@@ -557,6 +728,14 @@ def _wait_until(
         if clock.monotonic() >= deadline:
             return False
         clock.sleep(interval)
+
+
+def _fully_stopped(manager: Systemctl, unit: str) -> bool:
+    properties = manager.show(unit)
+    return properties.get("MainPID") == "0" and properties.get("ActiveState") in {
+        "inactive",
+        "failed",
+    }
 
 
 def recover(  # noqa: PLR0913
@@ -578,7 +757,7 @@ def recover(  # noqa: PLR0913
     it stopped on purpose.
     """
     bridge = settings.bridge_unit
-    state.resets.append(clock.wall())
+    state.resets.append(clock.stamp())
     state.last_result = "in_progress"
     persist(state)
     log(4, "Repeated Casambi BLE startup failure: resetting Bluetooth once")
@@ -596,7 +775,7 @@ def recover(  # noqa: PLR0913
         manager.action("stop", bridge, settings.stop_timeout)
         bridge_stopped = True
         if not _wait_until(
-            lambda: manager.show(bridge).get("MainPID") == "0",
+            lambda: _fully_stopped(manager, bridge),
             settings.stop_timeout,
             clock,
             settings.poll_interval,
@@ -624,10 +803,10 @@ def recover(  # noqa: PLR0913
     previous_instance = None if previous is None else previous.instance_id
 
     def recovered() -> bool:
-        record = read_record()
+        unit = UnitView.from_properties(manager.show(bridge))
+        record = trusted_record(read_record(), unit)
         return (
             record is not None
-            and record.alive
             and record.phase == "ready"
             and record.instance_id != previous_instance
         )
@@ -636,9 +815,8 @@ def recover(  # noqa: PLR0913
         recovered, settings.verify_seconds, clock, settings.poll_interval
     ):
         state.last_result = "verify_failed"
-        if (
-            len(_recent(state.resets, clock.wall(), settings.long_window))
-            >= settings.max_resets_long
+        if len(_recent(state.resets, clock, settings.long_window)) >= (
+            settings.max_resets_long
         ):
             return fail("verify_failed_budget_exhausted")
         persist(state)
@@ -649,6 +827,22 @@ def recover(  # noqa: PLR0913
     persist(state)
     log(5, "Casambi bridge recovered after a Bluetooth reset")
     return True
+
+
+def restart_bridge(
+    manager: Systemctl, settings: Settings, state: State, clock: Clock
+) -> None:
+    """Budgeted plain restart of a bridge systemd gave up on; no Bluetooth."""
+    state.plain_restarts.append(clock.stamp())
+    try:
+        manager.action("reset-failed", settings.bridge_unit, settings.stop_timeout)
+        manager.action("start", settings.bridge_unit, settings.stop_timeout)
+    except ServiceManagerError:
+        state.last_result = "bridge_restart_failed"
+        log(3, "Casambi bridge restart after systemd gave up failed")
+        return
+    state.last_result = "bridge_restarted"
+    log(5, "Casambi bridge restarted after systemd gave up (no Bluetooth reset)")
 
 
 def run_once(
@@ -664,10 +858,15 @@ def run_once(
         if not acquired:
             log(6, "Another recovery run holds the lock; nothing to do")
             return "locked"
+        try:
+            unit = UnitView.from_properties(manager.show(settings.bridge_unit))
+        except ServiceManagerError:
+            log(3, "Unable to read the bridge unit state; nothing done")
+            return "systemd_unavailable"
         state = load_state(settings)
         record = reader()
-        observe(state, record, clock.wall(), clock.monotonic(), settings)
-        decision = decide(state, record, clock.wall(), settings)
+        observe(state, unit, record, clock, settings)
+        decision = decide(state, unit, record, clock, settings)
         if decision.action == ACTION_LATCH:
             state.recovery_failed = True
             state.reason = decision.reason
@@ -675,6 +874,10 @@ def run_once(
             save_state(settings, state)
             log(2, f"Casambi bridge recovery failed: {decision.reason}; no reset")
             return decision.reason
+        if decision.action == ACTION_RESTART:
+            restart_bridge(manager, settings, state, clock)
+            save_state(settings, state)
+            return state.last_result
         save_state(settings, state)
         if decision.action != ACTION_RECOVER:
             return decision.reason
@@ -682,7 +885,7 @@ def run_once(
             manager,
             settings,
             state,
-            record,
+            trusted_record(record, unit),
             clock,
             reader,
             lambda current: save_state(settings, current),

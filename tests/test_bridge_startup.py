@@ -12,7 +12,10 @@ import types
 
 import aiomqtt
 import pytest
-from test_bridge_lifecycle import load_server_module
+from test_bridge_lifecycle import (  # noqa: F401  # autouse fixture
+    _clean_third_party_loggers,
+    load_server_module,
+)
 
 DEVICE = types.SimpleNamespace(address="configured-address")
 
@@ -472,3 +475,92 @@ def test_process_start_ticks_handles_spaces_and_parens_in_comm(server, monkeypat
     monkeypatch.setattr(server, "_read_text", lambda path: stat)
     # Field 22 overall is the 20th field after the command name.
     assert server.process_start_ticks(42) == 22
+
+
+# ---------------------------------------------------------------------------
+# Wedged BLE operations (cancellation that never finishes)
+# ---------------------------------------------------------------------------
+
+
+def stubborn(release):
+    """
+    An operation that ignores cancellation, like a hung D-Bus StopDiscovery.
+
+    It only ends once the test sets ``release``, so the event loop can be
+    torn down afterwards.
+    """
+
+    async def run():
+        try:
+            await asyncio.Future()
+        finally:
+            while not release.is_set():
+                try:
+                    await release.wait()
+                except asyncio.CancelledError:
+                    continue
+
+    return run
+
+
+@pytest.mark.asyncio
+async def test_wedged_discovery_hard_exits_instead_of_hanging(server, hp, monkeypatch):
+    monkeypatch.setattr(server, "DISCOVERY_DEADLINE_SECONDS", 0.01)
+    monkeypatch.setattr(server, "BLE_CANCEL_GRACE", 0.01)
+    exits = []
+
+    class Exited(BaseException):
+        pass
+
+    def hard_exit(code):
+        exits.append(code)
+        raise Exited
+
+    monkeypatch.setattr(server, "_hard_exit", hard_exit)
+    release = asyncio.Event()
+    patch_bridge(server, monkeypatch, discover=stubborn(release))
+    health = server.BridgeHealth()
+
+    try:
+        with pytest.raises(Exited):
+            await asyncio.wait_for(
+                server.main(sleep=Sleeps(), health=health), timeout=5
+            )
+    finally:
+        release.set()
+        await asyncio.sleep(0)
+
+    assert exits == [server.EXIT_BLE_STARTUP_FAILED]
+    assert (health.phase, health.error) == (hp.PHASE_OFFLINE, hp.ERROR_BLE_DISCOVERY_FAILED)
+    # The failure was still reported before leaving.
+    assert RecordingClient.instances
+
+
+@pytest.mark.asyncio
+async def test_run_bounded_returns_raises_timeout_or_wedged(server, monkeypatch):
+    monkeypatch.setattr(server, "BLE_CANCEL_GRACE", 0.01)
+
+    async def quick():
+        return 42
+
+    async def slow_but_cancellable():
+        await asyncio.Future()
+
+    assert await server.run_bounded(quick(), 1) == 42
+    with pytest.raises(TimeoutError):
+        await server.run_bounded(slow_but_cancellable(), 0.01)
+    release = asyncio.Event()
+    try:
+        with pytest.raises(server._BleWedgedError):
+            await server.run_bounded(stubborn(release)(), 0.01)
+    finally:
+        release.set()
+        await asyncio.sleep(0)
+
+
+def test_cli_network_not_found_is_not_a_ble_exit(server, monkeypatch):
+    async def not_found():
+        raise server.StartupFailedError("network_not_found")
+
+    monkeypatch.setattr(server, "main", not_found)
+    assert server.cli([]) == server.EXIT_STARTUP_FAILED_OTHER == 79

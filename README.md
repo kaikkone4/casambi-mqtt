@@ -10,7 +10,7 @@ A local-push Home Assistant integration for Casambi networks. A separate Bluetoo
 
 - Adds the versioned, non-actuating bridge health protocol v1 (`casambi/<network>/status`, `casambi/<network>/health/reply`, `GET_STATUS`, and a correlated `PUBLISH_ENTITIES` snapshot). See [docs/health-protocol.md](docs/health-protocol.md) for topics, minimum ACLs, what it does and does not prove, and rollback.
 - The Home Assistant component observes bridge freshness and whether its own unit consumer still handles messages, and reports it in the config entry's diagnostics. It takes no recovery action yet.
-- The bridge bounds BLE discovery/connect with deadlines and backoff, classifies BlueZ failures by their D-Bus error name, reports a failed startup over MQTT, and exits with distinct codes (75 BLE lost, 76 startup failed, 78 configuration). A root-owned, budgeted supervisor and systemd units for the bridge host are in `deploy/systemd/`; see [docs/pi-recovery.md](docs/pi-recovery.md).
+- The bridge bounds BLE discovery/connect with deadlines and backoff, classifies BlueZ failures by their D-Bus error name, reports a failed startup over MQTT, and exits with distinct codes (75 BLE lost, 76 BLE startup failed, 78 configuration, 79 other startup failure). A root-owned, budgeted supervisor and systemd units for the bridge host are in `deploy/systemd/`; see [docs/pi-recovery.md](docs/pi-recovery.md).
 - The bridge maps SIGTERM to a clean shutdown and registers a retained `offline` last will. Existing topics, payloads, commands and entity identities are unchanged.
 
 ### 0.2.9

@@ -2,12 +2,14 @@
 Root-owned recovery supervisor (#27) with a fake clock and service manager.
 
 Nothing here starts systemd, touches Bluetooth, uses sudo or reboots: the
-service manager is a fake that records every call, and the real Systemctl
-wrapper is only exercised with a fake ``run`` function.
+service manager is a fake that records every call and simulates the unit's
+systemd bookkeeping (NRestarts, ExecMainStatus, MainPID), and the real
+Systemctl wrapper is only exercised with a fake ``run`` function.
 """
 
 import importlib.util
 import json
+import os
 import subprocess
 import sys
 import threading
@@ -18,8 +20,9 @@ import pytest
 ROOT = Path(__file__).resolve().parents[1]
 BOOT = "11111111-2222-3333-4444-555555555555"
 OLD = "a" * 32
-OLDER = "c" * 32
 NEW = "b" * 32
+BRIDGE = "casambi-mqtt.service"
+BT = "bluetooth.service"
 
 
 @pytest.fixture
@@ -44,95 +47,122 @@ def settings(rec, tmp_path):
 
 
 class FakeClock:
-    def __init__(self, rec, wall=1_000_000.0, mono=5_000.0):
-        self.wall_now = wall
-        self.mono_now = mono
+    def __init__(self, rec):
+        self.wall_now = 1_000_000.0
+        self.mono_now = 5_000.0
+        self.boot = BOOT
         self.clock = rec.Clock(
             wall=lambda: self.wall_now,
             monotonic=lambda: self.mono_now,
-            sleep=self.sleep,
+            sleep=self.advance,
+            boottime=lambda: self.mono_now,
+            boot_id=lambda: self.boot,
         )
 
-    def sleep(self, seconds):
+    def advance(self, seconds):
         self.wall_now += seconds
         self.mono_now += seconds
 
-    def advance(self, seconds):
-        self.sleep(seconds)
-
 
 class FakeManager:
-    """Records every systemctl call; simulates unit state."""
+    """Records systemctl calls; simulates the bridge unit's systemd counters."""
 
-    def __init__(self, rec, *, fail_verb=None, stop_hangs=False, result="success"):
+    def __init__(self, rec, *, fail_verb=None, stop_hangs=False):
         self.rec = rec
         self.calls = []
         self.fail_verb = fail_verb
         self.stop_hangs = stop_hangs
-        self.bridge_pid = "1234"
-        self.result = result
-        self.allowed = frozenset({"casambi-mqtt.service", "bluetooth.service"})
-        self.on_start = None
+        self.active = "active"
+        self.main_pid = 100
+        self.exec_main_pid = 100
+        self.exec_main_status = 0
+        self.n_restarts = 0
+        self.result = "success"
+        self.after_start = None
 
+    # -- simulated bridge lifecycle -------------------------------------
+    def bridge_exits(self, status, *, restarted=True):
+        self.exec_main_status = status
+        self.exec_main_pid = self.main_pid
+        if restarted:
+            self.n_restarts += 1
+            self.main_pid += 1
+            self.active = "activating"
+        else:
+            self.main_pid = 0
+            self.active = "failed"
+            self.result = "start-limit-hit"
+
+    # -- Systemctl interface -----------------------------------------------
     def action(self, verb, unit, timeout):
-        assert unit in self.allowed
+        assert unit in {BRIDGE, BT}
         self.calls.append((verb, unit))
         if verb == self.fail_verb:
             raise self.rec.ServiceManagerError(verb)
-        if verb == "stop" and unit == "casambi-mqtt.service" and not self.stop_hangs:
-            self.bridge_pid = "0"
-        if verb == "start" and self.on_start is not None:
-            self.on_start()
+        if unit == BRIDGE and verb == "stop" and not self.stop_hangs:
+            self.main_pid = 0
+            self.active = "inactive"
+        if unit == BRIDGE and verb == "reset-failed":
+            self.result = "success"
+        if unit == BRIDGE and verb == "start":
+            self.main_pid = 500
+            self.n_restarts = 0  # an explicit start begins a new count
+            self.active = "active"
+            if self.after_start:
+                self.after_start()
 
     def show(self, unit):
-        assert unit in self.allowed
-        if unit == "bluetooth.service":
+        assert unit in {BRIDGE, BT}
+        if unit == BT:
             return {"ActiveState": "active", "MainPID": "77"}
-        return {"MainPID": self.bridge_pid, "Result": self.result}
+        return {
+            "ActiveState": self.active,
+            "MainPID": str(self.main_pid),
+            "Result": self.result,
+            "ExecMainStatus": str(self.exec_main_status),
+            "ExecMainPID": str(self.exec_main_pid),
+            "NRestarts": str(self.n_restarts),
+        }
 
     @property
     def mutations(self):
         return list(self.calls)
 
 
-def view(rec, instance, *, alive, phase="offline", error="ble_discovery_in_progress",
-         ever_ready=False, ready_since=None):
+def record(rec, manager, instance, *, phase="discovering", error="none", alive=True,
+           pid=None, updated=None):
     return rec.RecordView(
         instance_id=instance,
-        pid=1234,
+        pid=manager.main_pid if pid is None else pid,
         phase=phase,
         error=error,
-        ever_ready=ever_ready,
-        ready_since=ready_since,
-        updated=0.0,
+        ever_ready=phase == "ready",
+        ready_since=None,
+        updated=5_000.0 if updated is None else updated,
         alive=alive,
     )
 
 
-class Records:
-    """A sequence of record observations; the last one repeats."""
-
-    def __init__(self, *records):
-        self.records = list(records)
-
-    def __call__(self):
-        if len(self.records) > 1:
-            return self.records.pop(0)
-        return self.records[0]
+def run(rec, settings, manager, fake, reader=lambda: None):
+    return rec.run_once(settings, manager, fake.clock, reader)
 
 
-def fail_two_processes(rec, settings, manager, fake, verify=None):
-    """Two distinct bridge processes died with InProgress, one minute apart."""
-    first = rec.run_once(
-        settings, manager, fake.clock, Records(view(rec, OLDER, alive=False))
-    )
-    fake.advance(60)
-    reader = Records(view(rec, OLD, alive=False), *(verify or []))
-    return first, rec.run_once(settings, manager, fake.clock, reader)
+def ble_loop(rec, settings, manager, fake, exits=2, reader=lambda: None):
+    """The bridge exits with 76 repeatedly; the timer runs after each exit."""
+    result = None
+    for _ in range(exits):
+        manager.bridge_exits(76)
+        fake.advance(70)
+        result = run(rec, settings, manager, fake, reader)
+    return result
 
 
-def ready_new(rec):
-    return view(rec, NEW, alive=True, phase="ready", error="none", ever_ready=True)
+def ready_after_start(rec, manager, holder):
+    def on_start():
+        holder["record"] = record(rec, manager, NEW, phase="ready")
+
+    manager.after_start = on_start
+    return lambda: holder.get("record")
 
 
 # ---------------------------------------------------------------------------
@@ -161,7 +191,7 @@ def test_invalid_settings_are_rejected(rec, env):
 
 def test_default_settings_match_the_documented_budget(rec):
     settings = rec.Settings.from_env({})
-    assert settings.bridge_unit == "casambi-mqtt.service"
+    assert settings.bridge_unit == BRIDGE
     assert (settings.max_resets_short, settings.short_window) == (1, 600)
     assert (settings.max_resets_long, settings.long_window) == (2, 1800)
 
@@ -178,6 +208,7 @@ def record_bytes(**overrides):
         "ble": "connected",
         "mqtt": "connected",
         "ever_ready": True,
+        "mqtt_reconnects": 3,
         "ready_since_monotonic": 10.0,
         "updated_monotonic": 20.0,
     }
@@ -190,9 +221,9 @@ def parse(rec, raw, ticks=999):
 
 
 def test_valid_live_record(rec):
-    record = parse(rec, record_bytes())
-    assert record.alive
-    assert record.phase == "ready"
+    parsed = parse(rec, record_bytes())
+    assert parsed.alive
+    assert parsed.mqtt_reconnects == 3
 
 
 def test_record_of_a_replaced_or_exited_process_is_not_alive(rec):
@@ -212,6 +243,7 @@ def test_record_of_a_replaced_or_exited_process_is_not_alive(rec):
         record_bytes(instance_id="../../etc"),
         record_bytes(ever_ready="yes"),
         record_bytes(updated_monotonic=-1),
+        record_bytes(mqtt_reconnects=-1),
         b"not json",
         b"[]",
         b"{" + b" " * 5000 + b"}",
@@ -221,171 +253,193 @@ def test_untrusted_record_fails_closed(rec, raw):
     assert parse(rec, raw) is None
 
 
+def test_record_reader_refuses_symlinks_and_fifos(rec, tmp_path):
+    real = tmp_path / "real.json"
+    real.write_bytes(record_bytes())
+    link = tmp_path / "link.json"
+    link.symlink_to(real)
+    fifo = tmp_path / "fifo.json"
+    os.mkfifo(fifo)
+
+    assert rec.read_record_bytes(real) == record_bytes()
+    assert rec.read_record_bytes(link) is None
+    assert rec.read_record_bytes(fifo) is None  # returns at once, no hang
+    assert rec.read_record_bytes(tmp_path / "missing.json") is None
+
+
 # ---------------------------------------------------------------------------
 # Decisions and full recovery
 # ---------------------------------------------------------------------------
 
 
-def test_repeated_ble_failure_does_exactly_stop_restart_start(rec, settings):
+def test_repeated_ble_exits_do_exactly_stop_restart_start(rec, settings):
     fake = FakeClock(rec)
     manager = FakeManager(rec)
+    holder = {}
+    reader = ready_after_start(rec, manager, holder)
 
-    first, second = fail_two_processes(
-        rec, settings, manager, fake, verify=[ready_new(rec)]
-    )
+    manager.bridge_exits(76)
+    fake.advance(70)
+    assert run(rec, settings, manager, fake, reader) == "no_repeated_ble_failure"
+    manager.bridge_exits(76)
+    fake.advance(70)
+    assert run(rec, settings, manager, fake, reader) == "recovered"
 
-    assert first == "no_repeated_ble_failure"
-    assert second == "recovered"
-    assert manager.mutations == [
-        ("stop", "casambi-mqtt.service"),
-        ("restart", "bluetooth.service"),
-        ("start", "casambi-mqtt.service"),
-    ]
+    assert manager.mutations == [("stop", BRIDGE), ("restart", BT), ("start", BRIDGE)]
     state = rec.load_state(settings)
     assert state.ble_failures == []
     assert len(state.resets) == 1
 
 
-def test_start_limit_hit_is_reset_only_inside_a_budgeted_recovery(rec, settings):
+def test_failures_missed_between_timer_runs_are_still_counted(rec, settings):
     fake = FakeClock(rec)
-    manager = FakeManager(rec, result="start-limit-hit")
+    manager = FakeManager(rec)
+    holder = {}
+    reader = ready_after_start(rec, manager, holder)
+    manager.bridge_exits(76)
+    manager.bridge_exits(76)
+    manager.bridge_exits(76)
+    fake.advance(200)
+    assert run(rec, settings, manager, fake, reader) == "recovered"
 
-    fail_two_processes(rec, settings, manager, fake, verify=[ready_new(rec)])
 
+def test_start_limit_hit_bridge_is_recovered_and_reset_failed(rec, settings):
+    fake = FakeClock(rec)
+    manager = FakeManager(rec)
+    holder = {}
+    reader = ready_after_start(rec, manager, holder)
+    manager.bridge_exits(76)
+    fake.advance(70)
+    run(rec, settings, manager, fake, reader)
+    # systemd gives up: the last exit is not an automatic restart.
+    manager.bridge_exits(76, restarted=False)
+    fake.advance(70)
+    assert run(rec, settings, manager, fake, reader) == "recovered"
     assert manager.mutations == [
-        ("stop", "casambi-mqtt.service"),
-        ("restart", "bluetooth.service"),
-        ("reset-failed", "casambi-mqtt.service"),
-        ("start", "casambi-mqtt.service"),
+        ("stop", BRIDGE),
+        ("restart", BT),
+        ("reset-failed", BRIDGE),
+        ("start", BRIDGE),
     ]
 
 
-def test_same_instance_is_counted_once(rec, settings):
+def test_same_exit_is_never_counted_twice(rec, settings):
     fake = FakeClock(rec)
     manager = FakeManager(rec)
+    manager.bridge_exits(76)
     for _ in range(5):
-        rec.run_once(settings, manager, fake.clock, Records(view(rec, OLD, alive=False)))
         fake.advance(60)
+        run(rec, settings, manager, fake)
+    assert manager.calls == []
+    assert len(rec.load_state(settings).ble_failures) == 1
+
+
+@pytest.mark.parametrize("status", [75, 78, 79, 1, 0])
+def test_non_ble_exits_never_reset_bluetooth(rec, settings, status):
+    fake = FakeClock(rec)
+    manager = FakeManager(rec)
+    for _ in range(6):
+        manager.bridge_exits(status)
+        fake.advance(70)
+        run(rec, settings, manager, fake)
     assert manager.calls == []
 
 
-@pytest.mark.parametrize(
-    ("error", "ever_ready"),
-    [
-        ("mqtt_error", True),
-        ("configuration", False),
-        ("network_not_found", False),
-        ("unknown", False),
-        ("shutdown", True),
-        ("ble_disconnected", True),
-    ],
-)
-def test_non_ble_faults_never_reset_bluetooth(rec, settings, error, ever_ready):
+def test_mqtt_outage_and_ha_consumer_fault_never_reset(rec, settings):
     fake = FakeClock(rec)
     manager = FakeManager(rec)
-    for instance in ("1" * 32, "2" * 32, "3" * 32, "4" * 32):
-        record = view(rec, instance, alive=False, error=error, ever_ready=ever_ready)
-        rec.run_once(settings, manager, fake.clock, Records(record))
-        fake.advance(30)
-    assert manager.calls == []
-
-
-def test_ha_consumer_fault_with_healthy_bridge_never_resets(rec, settings):
-    fake = FakeClock(rec)
-    manager = FakeManager(rec)
+    # The bridge stays up and reports ready (MQTT reconnects are internal;
+    # Home Assistant consumer faults are invisible here).
+    reader = lambda: record(rec, manager, NEW, phase="ready")  # noqa: E731
     for _ in range(10):
-        rec.run_once(settings, manager, fake.clock, Records(ready_new(rec)))
         fake.advance(60)
+        run(rec, settings, manager, fake, reader)
     assert manager.calls == []
 
 
-def test_budget_survives_bridge_restarts_and_new_instances(rec, settings):
+def test_forged_record_of_another_process_is_ignored(rec, settings):
     fake = FakeClock(rec)
     manager = FakeManager(rec)
-    fail_two_processes(rec, settings, manager, fake, verify=[ready_new(rec)])
+    rec.save_state(settings, rec.State(recovery_failed=True, reason="budget_exhausted"))
+    # pid 1 really exists and its start time matches, but it is not MainPID.
+    forged = lambda: record(rec, manager, NEW, phase="ready", pid=1)  # noqa: E731
+    for _ in range(100):
+        fake.advance(60)
+        run(rec, settings, manager, fake, forged)
+    assert rec.load_state(settings).recovery_failed
+
+
+def test_latch_clears_only_after_the_supervisor_observed_a_long_ready(rec, settings):
+    fake = FakeClock(rec)
+    manager = FakeManager(rec)
+    rec.save_state(settings, rec.State(recovery_failed=True, reason="budget_exhausted"))
+    ready = lambda: record(rec, manager, NEW, phase="ready")  # noqa: E731
+    run(rec, settings, manager, fake, ready)
+    fake.advance(settings.healthy_reset_seconds - 60)
+    run(rec, settings, manager, fake, ready)
+    assert rec.load_state(settings).recovery_failed
+    fake.advance(120)
+    run(rec, settings, manager, fake, ready)
+    assert rec.load_state(settings).recovery_failed is False
+
+
+def test_new_process_does_not_refill_the_budget(rec, settings):
+    fake = FakeClock(rec)
+    manager = FakeManager(rec)
+    holder = {}
+    reader = ready_after_start(rec, manager, holder)
+    assert ble_loop(rec, settings, manager, fake, reader=reader) == "recovered"
     assert len(manager.calls) == 3
 
-    # A new process starts (not yet healthy for long), then fails again twice.
-    fake.advance(60)
-    rec.run_once(
-        settings,
-        manager,
-        fake.clock,
-        Records(view(rec, NEW, alive=True, phase="starting", error="none")),
-    )
-    for instance in ("5" * 32, "6" * 32):
-        fake.advance(60)
-        result = rec.run_once(
-            settings, manager, fake.clock, Records(view(rec, instance, alive=False))
-        )
-
-    assert result == "budget_exhausted"
+    holder.clear()  # the new process now fails too
+    manager.after_start = None
+    assert ble_loop(rec, settings, manager, fake) == "budget_exhausted"
     assert len(manager.calls) == 3  # no second reset inside 10 minutes
     state = rec.load_state(settings)
     assert state.recovery_failed
     assert state.reason == "budget_exhausted"
 
 
-def test_latched_failure_stops_further_resets_until_verified_healthy(rec, settings):
-    fake = FakeClock(rec)
-    manager = FakeManager(rec)
-    rec.save_state(settings, rec.State(recovery_failed=True, reason="budget_exhausted"))
-    for instance in ("5" * 32, "6" * 32, "7" * 32):
-        fake.advance(3600)
-        rec.run_once(
-            settings, manager, fake.clock, Records(view(rec, instance, alive=False))
-        )
-    assert manager.calls == []
-
-    # A new instance that has been ready for a long, verified period clears it.
-    healthy = view(
-        rec,
-        NEW,
-        alive=True,
-        phase="ready",
-        error="none",
-        ever_ready=True,
-        ready_since=fake.mono_now - settings.healthy_reset_seconds,
-    )
-    rec.run_once(settings, manager, fake.clock, Records(healthy))
-    assert rec.load_state(settings).recovery_failed is False
-
-
 def test_two_resets_per_thirty_minutes_then_latch(rec, settings):
     fake = FakeClock(rec)
     manager = FakeManager(rec)
+    holder = {}
     results = []
-    for round_number in range(3):
-        instances = [f"{round_number}{n}" * 16 for n in (1, 2)]
-        for instance in instances:
-            fake.advance(60)
-            results.append(
-                rec.run_once(
-                    settings,
-                    manager,
-                    fake.clock,
-                    Records(view(rec, instance, alive=False), ready_new(rec)),
-                )
-            )
+    for _ in range(3):
+        reader = ready_after_start(rec, manager, holder)
+        holder.clear()
+        results.append(ble_loop(rec, settings, manager, fake, reader=reader))
         fake.advance(601)
-    assert results.count("recovered") == 2
-    assert results[-1] == "budget_exhausted"
+    assert results == ["recovered", "recovered", "budget_exhausted"]
     assert [call for call in manager.calls if call[0] == "restart"] == [
-        ("restart", "bluetooth.service")
+        ("restart", BT)
     ] * 2
+
+
+def test_forward_clock_jump_does_not_refill_the_budget(rec, settings):
+    fake = FakeClock(rec)
+    manager = FakeManager(rec)
+    holder = {}
+    assert (
+        ble_loop(rec, settings, manager, fake, reader=ready_after_start(rec, manager, holder))
+        == "recovered"
+    )
+    holder.clear()
+    manager.after_start = None
+    fake.wall_now += 7 * 24 * 3600  # NTP steps the wall clock forward a week
+    assert ble_loop(rec, settings, manager, fake) == "budget_exhausted"
+    assert len(manager.calls) == 3
 
 
 def test_failure_mid_recovery_is_recovery_failed_and_restarts_bridge(rec, settings):
     fake = FakeClock(rec)
     manager = FakeManager(rec, fail_verb="restart")
 
-    _, result = fail_two_processes(rec, settings, manager, fake)
-
-    assert result == "recovery_failed"
+    assert ble_loop(rec, settings, manager, fake) == "recovery_failed"
     assert manager.mutations == [
-        ("stop", "casambi-mqtt.service"),
-        ("restart", "bluetooth.service"),
-        ("start", "casambi-mqtt.service"),  # cleanup: never left stopped
+        ("stop", BRIDGE),
+        ("restart", BT),
+        ("start", BRIDGE),  # cleanup: never left stopped
     ]
     state = rec.load_state(settings)
     assert state.recovery_failed
@@ -396,34 +450,74 @@ def test_bridge_that_does_not_stop_blocks_bluetooth_reset(rec, settings):
     fake = FakeClock(rec)
     manager = FakeManager(rec, stop_hangs=True)
 
-    _, result = fail_two_processes(rec, settings, manager, fake)
-
-    assert result == "recovery_failed"
-    assert ("restart", "bluetooth.service") not in manager.calls
+    assert ble_loop(rec, settings, manager, fake) == "recovery_failed"
+    assert ("restart", BT) not in manager.calls
     assert rec.load_state(settings).reason == "bridge_stop_timeout"
 
 
 def test_unverified_recovery_is_not_success(rec, settings):
     fake = FakeClock(rec)
     manager = FakeManager(rec)
-    still_failing = view(rec, NEW, alive=True, phase="discovering")
+    still_failing = lambda: record(rec, manager, NEW, phase="discovering")  # noqa: E731
 
-    _, result = fail_two_processes(rec, settings, manager, fake, verify=[still_failing])
-
-    assert result == "verify_failed"
+    assert ble_loop(rec, settings, manager, fake, reader=still_failing) == "verify_failed"
     state = rec.load_state(settings)
     assert state.last_result == "verify_failed"
     assert len(state.resets) == 1
 
 
-def test_old_record_never_verifies_a_recovery(rec, settings):
+def test_ready_record_of_a_different_process_never_verifies(rec, settings):
     fake = FakeClock(rec)
     manager = FakeManager(rec)
-    stale_ready = view(rec, OLD, alive=True, phase="ready", error="none")
+    stale = lambda: record(rec, manager, NEW, phase="ready", pid=4242)  # noqa: E731
 
-    _, result = fail_two_processes(rec, settings, manager, fake, verify=[stale_ready])
+    assert ble_loop(rec, settings, manager, fake, reader=stale) == "verify_failed"
 
-    assert result == "verify_failed"
+
+def test_live_process_stuck_in_discovery_counts_as_ble_failure(rec, settings):
+    fake = FakeClock(rec)
+    manager = FakeManager(rec)
+    holder = {}
+    stuck = {"record": record(rec, manager, OLD, updated=fake.mono_now)}
+
+    def reader():
+        return holder.get("record") or stuck["record"]
+
+    manager.after_start = lambda: holder.update(
+        record=record(rec, manager, NEW, phase="ready")
+    )
+    fake.advance(rec.STUCK_SECONDS + 1)
+    run(rec, settings, manager, fake, reader)
+    assert len(rec.load_state(settings).ble_failures) == 1
+    manager.bridge_exits(76)
+    fake.advance(70)
+    assert run(rec, settings, manager, fake, reader) == "recovered"
+
+
+def test_bridge_systemd_gave_up_on_for_other_reasons_gets_one_plain_restart(
+    rec, settings
+):
+    fake = FakeClock(rec)
+    manager = FakeManager(rec)
+    manager.bridge_exits(79, restarted=False)  # e.g. network not found
+    assert run(rec, settings, manager, fake) == "bridge_restarted"
+    assert manager.mutations == [("reset-failed", BRIDGE), ("start", BRIDGE)]
+
+    manager.bridge_exits(79, restarted=False)
+    fake.advance(600)
+    assert run(rec, settings, manager, fake) == "bridge_failed_restart_budget_used"
+    assert len(manager.calls) == 2
+    assert ("restart", BT) not in manager.calls
+
+
+def test_configuration_failure_is_never_restarted(rec, settings):
+    fake = FakeClock(rec)
+    manager = FakeManager(rec)
+    manager.bridge_exits(78, restarted=False)
+    for _ in range(5):
+        fake.advance(3600)
+        run(rec, settings, manager, fake)
+    assert manager.calls == []
 
 
 def test_corrupt_state_fails_closed(rec, settings):
@@ -432,7 +526,7 @@ def test_corrupt_state_fails_closed(rec, settings):
     fake = FakeClock(rec)
     manager = FakeManager(rec)
 
-    fail_two_processes(rec, settings, manager, fake)
+    ble_loop(rec, settings, manager, fake, exits=4)
 
     assert manager.calls == []
     assert rec.load_state(settings).reason == "state_unreadable"
@@ -445,11 +539,11 @@ def test_corrupt_state_fails_closed(rec, settings):
 
 def test_held_lock_means_no_second_operation(rec, settings):
     manager = FakeManager(rec)
+    manager.bridge_exits(76)
+    manager.bridge_exits(76)
     with rec.exclusive_lock(settings) as acquired:
         assert acquired
-        result = rec.run_once(
-            settings, manager, FakeClock(rec).clock, Records(view(rec, OLD, alive=False))
-        )
+        result = run(rec, settings, manager, FakeClock(rec))
     assert result == "locked"
     assert manager.calls == []
 
@@ -467,18 +561,15 @@ def test_concurrent_failure_and_timer_triggers_produce_one_recovery(rec, setting
             super().action(verb, unit, timeout)
 
     manager = BlockingManager(rec)
-    rec.run_once(settings, manager, fake.clock, Records(view(rec, OLDER, alive=False)))
+    holder = {}
+    reader = ready_after_start(rec, manager, holder)
+    manager.bridge_exits(76)
+    run(rec, settings, manager, fake, reader)
+    manager.bridge_exits(76)
     results = []
 
     def trigger():
-        results.append(
-            rec.run_once(
-                settings,
-                manager,
-                fake.clock,
-                Records(view(rec, OLD, alive=False), ready_new(rec)),
-            )
-        )
+        results.append(run(rec, settings, manager, fake, reader))
 
     first = threading.Thread(target=trigger)
     first.start()
@@ -490,14 +581,8 @@ def test_concurrent_failure_and_timer_triggers_produce_one_recovery(rec, setting
     first.join(5)
 
     assert sorted(results) == ["locked", "recovered"]
-    assert [call for call in manager.calls if call[0] == "restart"] == [
-        ("restart", "bluetooth.service")
-    ]
-    # A later trigger finds nothing left to do.
-    assert (
-        rec.run_once(settings, manager, fake.clock, Records(ready_new(rec)))
-        == "no_repeated_ble_failure"
-    )
+    assert [call for call in manager.calls if call[0] == "restart"] == [("restart", BT)]
+    assert run(rec, settings, manager, fake, reader) == "bridge_ready"
 
 
 # ---------------------------------------------------------------------------
@@ -508,27 +593,28 @@ def test_concurrent_failure_and_timer_triggers_produce_one_recovery(rec, setting
 def test_systemctl_wrapper_uses_fixed_argv_and_allowlist(rec):
     calls = []
 
-    def run(argv, **kwargs):
+    def run_fake(argv, **kwargs):
         calls.append((argv, kwargs))
-        return subprocess.CompletedProcess(argv, 0, stdout="MainPID=0\nOther=x\n")
+        return subprocess.CompletedProcess(
+            argv, 0, stdout="MainPID=0\nNRestarts=4\nOther=x\n"
+        )
 
     manager = rec.Systemctl(
-        frozenset({"casambi-mqtt.service", "bluetooth.service"}),
-        run=run,
-        executable="/usr/bin/systemctl",
+        frozenset({BRIDGE, BT}), run=run_fake, executable="/usr/bin/systemctl"
     )
-    manager.action("restart", "bluetooth.service", 5)
-    assert manager.show("casambi-mqtt.service") == {"MainPID": "0"}
+    manager.action("restart", BT, 5)
+    assert manager.show(BRIDGE) == {"MainPID": "0", "NRestarts": "4"}
     for verb, unit in (
         ("restart", "ssh.service"),
         ("restart", "bluetooth.service; reboot"),
-        ("reboot", "bluetooth.service"),
-        ("isolate", "casambi-mqtt.service"),
+        ("reboot", BT),
+        ("isolate", BRIDGE),
     ):
         with pytest.raises(rec.ServiceManagerError):
             manager.action(verb, unit, 5)
 
-    assert calls[0][0] == ["/usr/bin/systemctl", "restart", "bluetooth.service"]
+    assert calls[0][0] == ["/usr/bin/systemctl", "restart", BT]
+    assert calls[1][0][:3] == ["/usr/bin/systemctl", "show", BRIDGE]
     assert all("shell" not in kwargs for _, kwargs in calls)
     assert len(calls) == 2
 
@@ -540,10 +626,20 @@ def test_systemctl_failure_and_timeout_raise(rec):
     def hanging(argv, **kwargs):
         raise subprocess.TimeoutExpired(argv, 1)
 
-    for run in (failing, hanging):
-        manager = rec.Systemctl(frozenset({"bluetooth.service"}), run=run)
+    for run_fake in (failing, hanging):
+        manager = rec.Systemctl(frozenset({BT}), run=run_fake)
         with pytest.raises(rec.ServiceManagerError):
-            manager.action("restart", "bluetooth.service", 1)
+            manager.action("restart", BT, 1)
+
+
+def test_unreadable_unit_state_does_nothing(rec, settings):
+    class Broken(FakeManager):
+        def show(self, unit):
+            raise self.rec.ServiceManagerError("show")
+
+    manager = Broken(rec)
+    assert run(rec, settings, manager, FakeClock(rec)) == "systemd_unavailable"
+    assert manager.calls == []
 
 
 def test_operator_reset_clears_the_latch(rec, settings, monkeypatch):
