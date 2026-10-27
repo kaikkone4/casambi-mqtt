@@ -22,6 +22,8 @@ from .const import (
 )
 from .entities.entities import Scene, Unit
 from .event import async_add_switch_buttons
+from .health import HealthObserver, HealthSettings
+from .health_monitor import HealthMonitor
 from .light import CasambiMqttLight
 from .runtime_data import CasambiMqttRuntimeData
 from .scene import CasambiMqttScene
@@ -250,6 +252,9 @@ async def async_setup_entry(  # noqa: PLR0915
     event_prefix = f"{MQTT_TOPIC_PREFIX}/{network_name}/events/"
     scene_prefix = f"{MQTT_TOPIC_PREFIX}/{network_name}/scenes/"
     switch_event_topic = f"{MQTT_TOPIC_PREFIX}/{network_name}/switch_events"
+    health = HealthObserver(HealthSettings.from_options(entry.options), event_prefix)
+    entry.runtime_data.health = health
+    health_monitor = HealthMonitor(hass, entry, network_name, health)
 
     async def event_processor(  # noqa: PLR0911, PLR0912
         msg: ReceiveMessage,
@@ -282,6 +287,9 @@ async def async_setup_entry(  # noqa: PLR0915
             LOGGER.warning("Invalid Casambi unit payload on topic %s", msg.topic)
             return
         if unit_kind != Unit.TYPE_LIGHT:
+            # A valid unit this entry deliberately does not represent: the
+            # consumer handled it, so it counts as processed.
+            health.on_processed_unit(msg.topic)
             return
 
         if unit.address:
@@ -311,6 +319,9 @@ async def async_setup_entry(  # noqa: PLR0915
             async_add_entities([light_entity])
         else:
             runtime_data.lights[msg.topic].update_entity(unit)
+        # Only after the entity callback returned: an unchanged value counts,
+        # a raised exception or an unready platform does not.
+        health.on_processed_unit(msg.topic)
 
     async def scene_processor(msg: ReceiveMessage) -> None:
         if not msg.payload or not msg.topic.startswith(scene_prefix):
@@ -363,6 +374,7 @@ async def async_setup_entry(  # noqa: PLR0915
                 1,
             )
         )
+        unsubscribers.extend(await health_monitor.async_subscribe(async_subscribe))
     except Exception:
         for unsubscribe in unsubscribers:
             unsubscribe()

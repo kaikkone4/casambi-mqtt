@@ -4,10 +4,13 @@ import json
 import logging
 import os
 import re
+import secrets
+import signal
 import sys
 import time
-from collections.abc import Awaitable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, fields
+from datetime import UTC, datetime
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote
 
@@ -17,6 +20,7 @@ import CasambiBt
 from CasambiBt import Casambi, discover
 from dotenv import load_dotenv
 
+from custom_components.casambi_mqtt import health_protocol
 from custom_components.casambi_mqtt.const import is_valid_network_name
 from custom_components.casambi_mqtt.entities.commands import (
     PublishEntities,
@@ -51,6 +55,13 @@ LOOP_LAG_WARN_SECONDS = 1.0
 DIAGNOSTICS_INTERVAL_SECONDS = 300
 PUBLISH_RETRY_SECONDS = 1.0
 REDACTED_MESSAGE_MAX_LENGTH = 160
+DEFAULT_HEALTH_HEARTBEAT_SECONDS = 30
+MIN_HEALTH_HEARTBEAT_SECONDS = 5
+MAX_HEALTH_HEARTBEAT_SECONDS = 300
+HEALTH_PUBLISH_TIMEOUT = 10.0
+FINAL_STATUS_TIMEOUT = 2.0
+HEALTH_REPLY_MIN_INTERVAL = 1.0
+SNAPSHOT_REQUEST_MIN_INTERVAL = 30.0
 
 load_dotenv()
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO")
@@ -61,6 +72,9 @@ MQTT_PASSWORD = os.getenv("MQTT_PASSWORD")
 NETWORK_ADDRESS = os.getenv("CASAMBI_NETWORK_ADDRESS")
 NETWORK_PASSWORD = os.getenv("CASAMBI_NETWORK_PASSWORD")
 NETWORK_NAME = os.getenv("CASAMBI_NETWORK_NAME", "default")
+HEALTH_HEARTBEAT_SECONDS = os.getenv(
+    "HEALTH_HEARTBEAT_SECONDS", str(DEFAULT_HEALTH_HEARTBEAT_SECONDS)
+)
 LOGGER = logging.getLogger(__name__)
 LOGGER.setLevel(LOG_LEVEL)
 handler = logging.StreamHandler()
@@ -196,10 +210,268 @@ class BridgeDiagnostics:
     switch_dropped: int = 0
     ble_disconnects: int = 0
     loop_lag_ms_max: int = 0
+    health_status_published: int = 0
+    health_status_failed: int = 0
+    health_requests_rate_limited: int = 0
 
     def as_log_fields(self) -> str:
         return " ".join(
             f"{field.name}={getattr(self, field.name)}" for field in fields(self)
+        )
+
+
+def health_heartbeat_seconds() -> int:
+    """Return the validated status heartbeat interval, or raise on bad config."""
+    try:
+        value = int(HEALTH_HEARTBEAT_SECONDS)
+    except (TypeError, ValueError):
+        value = -1
+    if not MIN_HEALTH_HEARTBEAT_SECONDS <= value <= MAX_HEALTH_HEARTBEAT_SECONDS:
+        message = (
+            "HEALTH_HEARTBEAT_SECONDS must be an integer between "
+            f"{MIN_HEALTH_HEARTBEAT_SECONDS} and {MAX_HEALTH_HEARTBEAT_SECONDS}"
+        )
+        raise RuntimeError(message)
+    return value
+
+
+@dataclass(frozen=True)
+class SnapshotResult:
+    """Truthful outcome of one snapshot: only broker-confirmed publishes count."""
+
+    units: int
+    scenes: int
+    failed: int
+
+    @property
+    def ok(self) -> bool:
+        return self.failed == 0
+
+
+def _utc_now() -> str:
+    return datetime.now(UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+class BridgeHealth:
+    """
+    Process-lifetime health state behind the v1 status protocol.
+
+    One instance per bridge process, shared by every MQTT session, so the
+    ``instance_id`` and ``sequence`` survive an MQTT reconnect but never a
+    process restart: a new process always starts at ``phase=starting`` with a
+    fresh random identity and cannot inherit a previous instance's ``ready``.
+    Durations use the monotonic clock; the UTC ``time`` field is diagnostic
+    only and is never used for freshness by any consumer.
+
+    What a status or reply proves: this process is alive, its MQTT session
+    works, and it believes its BLE link is connected. It does NOT prove a
+    physical radio round trip -- unit data comes from casambi-bt's in-memory
+    ``casa.units`` cache, and casambi-bt 0.3.2 exposes no non-actuating
+    ping. See docs/health-protocol.md.
+    """
+
+    def __init__(
+        self,
+        *,
+        monotonic: Callable[[], float] = time.monotonic,
+        wall_clock: Callable[[], str] = _utc_now,
+        instance_id: str | None = None,
+    ) -> None:
+        self.instance_id = instance_id or secrets.token_hex(16)
+        self._monotonic = monotonic
+        self._wall_clock = wall_clock
+        self._started = monotonic()
+        self.sequence = 0
+        self.phase = health_protocol.PHASE_STARTING
+        self.ble = health_protocol.LINK_UNKNOWN
+        self.mqtt = health_protocol.LINK_UNKNOWN
+        self.error = health_protocol.ERROR_NONE
+        self.state_publish_failing: Callable[[], bool] = lambda: False
+        self._snapshot = health_protocol.SnapshotSummary()
+        self._snapshot_completed_at: float | None = None
+        self._last_reply_at: float | None = None
+        self._last_snapshot_request_at: float | None = None
+        self._status_failure_streak = 0
+
+    def __repr__(self) -> str:
+        """Fixed-shape repr: integers and fixed enums only."""
+        return f"BridgeHealth(phase={self.phase}, sequence={self.sequence})"
+
+    def set_phase(self, phase: str, error: str = health_protocol.ERROR_NONE) -> None:
+        self.phase = phase
+        self.error = error
+
+    def session_started(self) -> None:
+        """Start a new MQTT session at ``starting`` until its snapshot lands."""
+        self.ble = health_protocol.LINK_CONNECTED
+        self.mqtt = health_protocol.LINK_CONNECTED
+        self.set_phase(health_protocol.PHASE_STARTING)
+
+    def record_snapshot(self, result: SnapshotResult) -> int:
+        """Record a completed snapshot and return its generation number."""
+        generation = self._snapshot.generation + 1
+        self._snapshot = health_protocol.SnapshotSummary(
+            generation=generation,
+            units=result.units,
+            scenes=result.scenes,
+            failed=result.failed,
+        )
+        self._snapshot_completed_at = self._monotonic()
+        if result.ok:
+            self.set_phase(health_protocol.PHASE_READY)
+        else:
+            self.set_phase(
+                health_protocol.PHASE_DEGRADED,
+                health_protocol.ERROR_SNAPSHOT_PUBLISH_FAILED,
+            )
+        return generation
+
+    def _effective_phase(self) -> tuple[str, str]:
+        if self.phase == health_protocol.PHASE_READY and self.state_publish_failing():
+            return (
+                health_protocol.PHASE_DEGRADED,
+                health_protocol.ERROR_STATE_PUBLISH_FAILED,
+            )
+        return self.phase, self.error
+
+    def build_status(self) -> health_protocol.BridgeStatus:
+        """Return the next status message; every call consumes one sequence."""
+        self.sequence += 1
+        now = self._monotonic()
+        age = (
+            None
+            if self._snapshot_completed_at is None
+            else int(now - self._snapshot_completed_at)
+        )
+        snapshot = health_protocol.SnapshotSummary(
+            generation=self._snapshot.generation,
+            units=self._snapshot.units,
+            scenes=self._snapshot.scenes,
+            failed=self._snapshot.failed,
+            age_s=age,
+        )
+        phase, error = self._effective_phase()
+        return health_protocol.BridgeStatus(
+            instance_id=self.instance_id,
+            sequence=self.sequence,
+            phase=phase,
+            ble=self.ble,
+            mqtt=self.mqtt,
+            uptime_s=int(now - self._started),
+            snapshot=snapshot,
+            error=error,
+            time=self._wall_clock(),
+        )
+
+    def will_payload(self) -> str:
+        """
+        Last-will status, fixed at MQTT client creation.
+
+        It cannot carry a live sequence, so it uses ``sequence: null``; the
+        protocol only allows that for ``phase=offline``, which no consumer
+        ever treats as healthy.
+        """
+        return health_protocol.BridgeStatus(
+            instance_id=self.instance_id,
+            sequence=None,
+            phase=health_protocol.PHASE_OFFLINE,
+            ble=health_protocol.LINK_UNKNOWN,
+            mqtt=health_protocol.LINK_DISCONNECTED,
+            uptime_s=None,
+            snapshot=health_protocol.SnapshotSummary(),
+            error=health_protocol.ERROR_CONNECTION_LOST,
+            time=None,
+        ).to_json()
+
+    async def publish_status(
+        self,
+        client: aiomqtt.Client,
+        diagnostics: BridgeDiagnostics | None = None,
+        *,
+        publish_timeout: float = HEALTH_PUBLISH_TIMEOUT,
+    ) -> bool:
+        """Publish one retained status, bounded so it can never block a caller."""
+        try:
+            await asyncio.wait_for(
+                client.publish(
+                    health_protocol.status_topic(TOPIC_PREFIX, NETWORK_NAME),
+                    payload=self.build_status().to_json(),
+                    qos=1,
+                    retain=True,
+                ),
+                timeout=publish_timeout,
+            )
+        except (aiomqtt.MqttError, TimeoutError):
+            self._status_failure_streak += 1
+            if diagnostics is not None:
+                diagnostics.health_status_failed += 1
+            if self._status_failure_streak == 1:
+                LOGGER.warning("Bridge status publish failed")
+            return False
+        self._status_failure_streak = 0
+        if diagnostics is not None:
+            diagnostics.health_status_published += 1
+        return True
+
+    def reply_allowed(self) -> bool:
+        """Coalesce health requests: at most one reply per interval."""
+        now = self._monotonic()
+        if (
+            self._last_reply_at is not None
+            and now - self._last_reply_at < HEALTH_REPLY_MIN_INTERVAL
+        ):
+            return False
+        self._last_reply_at = now
+        return True
+
+    def snapshot_request_allowed(self) -> bool:
+        """Bound correlated snapshot probes so they cannot become a flood."""
+        now = self._monotonic()
+        if (
+            self._last_snapshot_request_at is not None
+            and now - self._last_snapshot_request_at < SNAPSHOT_REQUEST_MIN_INTERVAL
+        ):
+            return False
+        self._last_snapshot_request_at = now
+        return True
+
+    async def publish_reply(
+        self,
+        client: aiomqtt.Client,
+        request_id: str,
+        result: str,
+        snapshot: SnapshotResult | None = None,
+        generation: int | None = None,
+    ) -> None:
+        status = self.build_status()
+        if snapshot is None:
+            reply = health_protocol.HealthReply(
+                health_protocol.REPLY_STATUS,
+                request_id,
+                self.instance_id,
+                result,
+                status,
+            )
+        else:
+            reply = health_protocol.HealthReply(
+                health_protocol.REPLY_SNAPSHOT,
+                request_id,
+                self.instance_id,
+                result,
+                status,
+                units=snapshot.units,
+                scenes=snapshot.scenes,
+                failed=snapshot.failed,
+                generation=generation or 0,
+            )
+        await asyncio.wait_for(
+            client.publish(
+                health_protocol.reply_topic(TOPIC_PREFIX, NETWORK_NAME),
+                payload=reply.to_json(),
+                qos=1,
+                retain=False,
+            ),
+            timeout=HEALTH_PUBLISH_TIMEOUT,
         )
 
 
@@ -578,6 +850,10 @@ class UnitStatePublisher:
         """Fixed-shape repr: class name plus integer counters only, no units."""
         return f"UnitStatePublisher(pending={len(self._pending)}, failed={self.failed})"
 
+    def is_failing(self) -> bool:
+        """Whether the newest publish attempt failed (a streak is open)."""
+        return self._failure_streak > 0
+
     def submit(self, unit: CasambiBt.Unit) -> None:
         topic = unit_event_topic(unit)
         if topic is None:
@@ -730,20 +1006,39 @@ def validate_command_keys(command: dict[str, object], action: str) -> None:
     allowed_keys = {
         SetLevel.ACTION: {"action", "address", "value", "unit_uuid"},
         TurnOn.ACTION: {"action", "address", "unit_uuid"},
-        PublishEntities.ACTION: {"action"},
+        PublishEntities.ACTION: {"action", "request_id"},
         SetScene.ACTION: {"action", "scene_id"},
+        GET_STATUS_ACTION: {"action", "request_id"},
     }
     required_keys = {
         SetLevel.ACTION: {"action", "address", "value"},
         TurnOn.ACTION: {"action", "address"},
         PublishEntities.ACTION: {"action"},
         SetScene.ACTION: {"action", "scene_id"},
+        GET_STATUS_ACTION: {"action", "request_id"},
     }
     if action not in allowed_keys:
         return
     if set(command) - allowed_keys[action] or not required_keys[action] <= set(command):
         message = "Casambi command has an invalid schema"
         raise ValueError(message)
+    if "request_id" in command and not health_protocol.is_valid_request_id(
+        command["request_id"]
+    ):
+        message = "Casambi health request ID is invalid"
+        raise ValueError(message)
+
+
+async def _publish_snapshot_message(
+    client: aiomqtt.Client, topic: str, payload: str | bytes
+) -> bool:
+    """Publish one retained snapshot message; False only on a broker failure."""
+    try:
+        await client.publish(topic, payload=payload, qos=1, retain=True)
+    except aiomqtt.MqttError as e:
+        LOGGER.warning("Unhandled exception: %s", e)
+        return False
+    return True
 
 
 async def publish_entities(casa: Casambi, client: aiomqtt.Client) -> tuple[int, int]:
@@ -754,8 +1049,22 @@ async def publish_entities(casa: Casambi, client: aiomqtt.Client) -> tuple[int, 
     deliberately avoids overflowing aiomqtt's pending-publish queue, which can
     otherwise leave Home Assistant with stale retained state.
     """
+    result = await publish_snapshot(casa, client)
+    return result.units, result.scenes
+
+
+async def publish_snapshot(casa: Casambi, client: aiomqtt.Client) -> SnapshotResult:
+    """
+    Publish the snapshot and count only broker-confirmed messages as published.
+
+    A failed publish is counted in ``failed`` and never as a unit or scene, so
+    a partial failure can never be reported as a successful snapshot. The
+    legacy ``events/`` tombstone is not a unit: it is never counted as one,
+    but its failure still makes the snapshot unsuccessful.
+    """
     units_published = 0
     scenes_published = 0
+    failed = 0
     addressless_uuid_counts: dict[str, int] = {}
     for unit in casa.units:
         if not unit.address and isinstance(getattr(unit, "uuid", None), str):
@@ -764,14 +1073,10 @@ async def publish_entities(casa: Casambi, client: aiomqtt.Client) -> tuple[int, 
             )
 
     # Clear the retained legacy collision before publishing UUID-keyed units.
-    await log_exceptions(
-        client.publish(
-            f"{TOPIC_PREFIX}/{NETWORK_NAME}/events/",
-            payload=b"",
-            qos=1,
-            retain=True,
-        )
-    )
+    if not await _publish_snapshot_message(
+        client, f"{TOPIC_PREFIX}/{NETWORK_NAME}/events/", b""
+    ):
+        failed += 1
 
     for unit in casa.units:
         if not unit.address:
@@ -782,37 +1087,51 @@ async def publish_entities(casa: Casambi, client: aiomqtt.Client) -> tuple[int, 
             ):
                 LOGGER.error("Skipping addressless Casambi unit with non-unique UUID")
                 continue
-        if await publish_unit(unit, client):
+        try:
+            published = await publish_unit(unit, client, suppress_errors=False)
+        except aiomqtt.MqttError as e:
+            LOGGER.warning("Unhandled exception: %s", e)
+            failed += 1
+            continue
+        if published:
             units_published += 1
 
     for scene in casa.scenes:
         scene_entity = to_scene(scene)
-        await log_exceptions(
-            client.publish(
-                f"{TOPIC_PREFIX}/{NETWORK_NAME}/scenes/{scene_entity.scene_id}",
-                payload=scene_entity.to_json(),
-                qos=1,
-                retain=True,
-            )
-        )
-        scenes_published += 1
+        if await _publish_snapshot_message(
+            client,
+            f"{TOPIC_PREFIX}/{NETWORK_NAME}/scenes/{scene_entity.scene_id}",
+            scene_entity.to_json(),
+        ):
+            scenes_published += 1
+        else:
+            failed += 1
 
     LOGGER.info(
         "Published Casambi state snapshot: %d units, %d scenes",
         units_published,
         scenes_published,
     )
-    return units_published, scenes_published
+    if failed:
+        LOGGER.warning("Casambi state snapshot had %d failed publishes", failed)
+    return SnapshotResult(units_published, scenes_published, failed)
 
 
+GET_STATUS_ACTION = health_protocol.GET_STATUS_ACTION
 _KNOWN_COMMAND_ACTIONS = frozenset(
-    {SetLevel.ACTION, TurnOn.ACTION, PublishEntities.ACTION, SetScene.ACTION}
+    {
+        SetLevel.ACTION,
+        TurnOn.ACTION,
+        PublishEntities.ACTION,
+        SetScene.ACTION,
+        GET_STATUS_ACTION,
+    }
 )
 
 
 def _safe_action_name(action: str) -> str:
     """
-    Return the action name only if it is one of the four known constants.
+    Return the action name only if it is one of the known constants.
 
     ``action`` otherwise comes straight from the MQTT command payload, so it
     is attacker/user-controlled text -- never log it verbatim.
@@ -820,8 +1139,67 @@ def _safe_action_name(action: str) -> str:
     return action if action in _KNOWN_COMMAND_ACTIONS else "<unrecognized>"
 
 
+async def _handle_snapshot_request(
+    casa: Casambi,
+    client: aiomqtt.Client,
+    request_id: str | None,
+    health: BridgeHealth | None,
+    diagnostics: BridgeDiagnostics | None,
+) -> None:
+    """
+    Run the legacy snapshot, or the correlated v1 snapshot probe.
+
+    Without a ``request_id`` this is byte-for-byte the legacy
+    ``PUBLISH_ENTITIES`` behaviour. With one, the reply is published only
+    after every snapshot publish has been confirmed by the broker (aiomqtt
+    awaits the QoS 1 PUBACK), and it reports ``failed`` unless all of them
+    succeeded -- an acknowledgement is never sent for a partial snapshot.
+    """
+    if request_id is None or health is None:
+        await publish_entities(casa, client)
+        return
+    if not health.snapshot_request_allowed():
+        if diagnostics is not None:
+            diagnostics.health_requests_rate_limited += 1
+        if health.reply_allowed():
+            await health.publish_reply(
+                client, request_id, health_protocol.RESULT_RATE_LIMITED
+            )
+        return
+    result = await publish_snapshot(casa, client)
+    generation = health.record_snapshot(result)
+    await health.publish_reply(
+        client,
+        request_id,
+        health_protocol.RESULT_OK if result.ok else health_protocol.RESULT_FAILED,
+        snapshot=result,
+        generation=generation,
+    )
+
+
+async def _handle_status_request(
+    client: aiomqtt.Client,
+    request_id: str,
+    health: BridgeHealth | None,
+    diagnostics: BridgeDiagnostics | None,
+) -> None:
+    """Answer GET_STATUS from bridge state only: never touches a Casambi unit."""
+    if health is None:
+        LOGGER.warning("Ignoring health request: bridge health is not enabled")
+        return
+    if not health.reply_allowed():
+        if diagnostics is not None:
+            diagnostics.health_requests_rate_limited += 1
+        return
+    await health.publish_reply(client, request_id, health_protocol.RESULT_OK)
+
+
 async def process_command(
-    message: aiomqtt.Message, casa: Casambi, client: aiomqtt.Client
+    message: aiomqtt.Message,
+    casa: Casambi,
+    client: aiomqtt.Client,
+    health: BridgeHealth | None = None,
+    diagnostics: BridgeDiagnostics | None = None,
 ) -> None:
     expected_topic = f"{TOPIC_PREFIX}/{NETWORK_NAME}/commands"
     if hasattr(message, "topic") and str(message.topic) != expected_topic:
@@ -858,18 +1236,31 @@ async def process_command(
                 unit = command_unit(casa, cmd.address, cmd.unit_uuid)
                 await casa.turnOn(unit)
             case PublishEntities.ACTION:
-                await publish_entities(casa, client)
+                await _handle_snapshot_request(
+                    casa, client, command.get("request_id"), health, diagnostics
+                )
+            case health_protocol.GET_STATUS_ACTION:
+                await _handle_status_request(
+                    client, command["request_id"], health, diagnostics
+                )
             case SetScene.ACTION:
                 cmd = SetScene.from_json(payload)
                 scene_id = validate_integer(cmd.scene_id, "scene ID")
                 scene = next(s for s in casa.scenes if s.sceneId == scene_id)
                 await casa.switchToScene(scene)
             case _:
-                # action is never one of the four known constants here (the
+                # action is never one of the known constants here (the
                 # cases above already matched them), so this is always
                 # fixed text -- no interpolation of attacker-controlled input.
                 LOGGER.warning("Ignoring unknown Casambi command action")
-    except (AttributeError, KeyError, StopIteration, TypeError, ValueError) as error:
+    except (
+        AttributeError,
+        KeyError,
+        StopIteration,
+        TypeError,
+        ValueError,
+        TimeoutError,
+    ) as error:
         LOGGER.warning(
             "Unable to process Casambi command %s: %s",
             _safe_action_name(action),
@@ -920,6 +1311,26 @@ async def run_heartbeat(
         if now - last_report >= DIAGNOSTICS_INTERVAL_SECONDS:
             last_report = now
             LOGGER.info("Bridge diagnostics: %s", diagnostics.as_log_fields())
+
+
+async def run_status_heartbeat(
+    health: BridgeHealth,
+    client: aiomqtt.Client,
+    diagnostics: BridgeDiagnostics | None = None,
+    *,
+    interval: float = DEFAULT_HEALTH_HEARTBEAT_SECONDS,
+    sleep: Any = asyncio.sleep,
+) -> None:
+    """
+    Publish the retained v1 status once per interval.
+
+    Runs as its own task so it never waits for a snapshot or a command to
+    finish; each publish is individually bounded by publish_status(). The
+    caller publishes the first status itself, so this sleeps first.
+    """
+    while True:
+        await sleep(interval)
+        await health.publish_status(client, diagnostics)
 
 
 async def _race_session_against_disconnect(
@@ -985,6 +1396,7 @@ class _ConnectedBridgeHandles:
     switch_publisher: SwitchEventPublisher
     unit_callback: Any
     heartbeat_task: asyncio.Task[None] | None = None
+    status_task: asyncio.Task[None] | None = None
     unit_registered: bool = False
     switch_registered: bool = False
 
@@ -993,13 +1405,15 @@ async def _cleanup_connected_bridge(
     casa: Casambi, handles: _ConnectedBridgeHandles
 ) -> None:
     """Reverse registration/startup order: newest-registered unwinds first."""
-    if handles.heartbeat_task is not None:
-        handles.heartbeat_task.cancel()
+    for task in (handles.heartbeat_task, handles.status_task):
+        if task is None:
+            continue
+        task.cancel()
         # Suppress any exception, not just CancelledError: a heartbeat
         # failure must never mask the original failure propagating out of
         # this cleanup (which can be a CasambiDisconnected).
         with contextlib.suppress(Exception, asyncio.CancelledError):
-            await handles.heartbeat_task
+            await task
     try:
         if handles.switch_registered:
             casa.unregisterSwitchEventHandler(handles.switch_publisher)
@@ -1014,8 +1428,29 @@ async def _cleanup_connected_bridge(
                 await handles.unit_publisher.aclose()
 
 
-async def run_connected_bridge(
-    casa: Casambi, client: aiomqtt.Client, disconnected: asyncio.Event
+async def _publish_final_status(
+    health: BridgeHealth,
+    client: aiomqtt.Client,
+    diagnostics: BridgeDiagnostics,
+    final_status: tuple[str, str, str],
+) -> None:
+    """Best-effort, bounded last status before a session ends on purpose."""
+    phase, error, ble = final_status
+    health.set_phase(phase, error)
+    health.ble = ble
+    with contextlib.suppress(Exception):
+        await health.publish_status(
+            client, diagnostics, publish_timeout=FINAL_STATUS_TIMEOUT
+        )
+
+
+async def run_connected_bridge(  # noqa: PLR0915
+    casa: Casambi,
+    client: aiomqtt.Client,
+    disconnected: asyncio.Event,
+    health: BridgeHealth | None = None,
+    *,
+    heartbeat_seconds: float = DEFAULT_HEALTH_HEARTBEAT_SECONDS,
 ) -> None:
     """
     Run one connected MQTT session with paired callback cleanup.
@@ -1026,6 +1461,11 @@ async def run_connected_bridge(
     during the session (including mid-snapshot) aborts that work and
     surfaces as CasambiDisconnected, rather than hanging or completing as if
     nothing happened.
+
+    With ``health`` (always passed by main()), the session also runs the v1
+    status heartbeat from before the baseline snapshot, answers GET_STATUS
+    and correlated snapshot probes, and publishes a bounded final status on
+    BLE loss or shutdown. Without it the session is the pre-v1 bridge.
     """
     diagnostics = BridgeDiagnostics()
     unit_publisher = UnitStatePublisher(client, diagnostics=diagnostics)
@@ -1044,7 +1484,7 @@ async def run_connected_bridge(
             # payload carry the network name, unit address/UUID, scene id
             # and brightness value -- never log them, at any level.
             diagnostics.commands_received += 1
-            await process_command(message, casa, client)
+            await process_command(message, casa, client, health, diagnostics)
 
     handles = _ConnectedBridgeHandles(
         unit_publisher=unit_publisher,
@@ -1055,10 +1495,25 @@ async def run_connected_bridge(
     async def session_body() -> None:
         await client.subscribe(f"{TOPIC_PREFIX}/{NETWORK_NAME}/commands")
 
+        if health is not None:
+            health.session_started()
+            health.state_publish_failing = unit_publisher.is_failing
+            await health.publish_status(client, diagnostics)
+            handles.status_task = asyncio.create_task(
+                run_status_heartbeat(
+                    health, client, diagnostics, interval=heartbeat_seconds
+                )
+            )
+
         # Publish the baseline before registering live updates. Casambi can emit
         # an initial UnitChanged burst during registration; handling it in
         # parallel would recreate the MQTT queue exhaustion this snapshot avoids.
-        await publish_entities(casa, client)
+        if health is None:
+            await publish_entities(casa, client)
+        else:
+            health.record_snapshot(await publish_snapshot(casa, client))
+            # Phase change: report it now rather than at the next heartbeat.
+            await health.publish_status(client, diagnostics)
         await unit_publisher.start()
         await switch_publisher.start()
 
@@ -1073,6 +1528,7 @@ async def run_connected_bridge(
 
         await consume_commands()
 
+    final_status: tuple[str, str, str] | None = None
     try:
         session_task = asyncio.create_task(session_body())
         disconnect_task = asyncio.create_task(disconnected.wait())
@@ -1080,16 +1536,73 @@ async def run_connected_bridge(
             await _race_session_against_disconnect(session_task, disconnect_task)
         except CasambiDisconnected:
             diagnostics.ble_disconnects += 1
+            final_status = (
+                health_protocol.PHASE_DEGRADED,
+                health_protocol.ERROR_BLE_DISCONNECTED,
+                health_protocol.LINK_DISCONNECTED,
+            )
+            raise
+        except asyncio.CancelledError:
+            final_status = (
+                health_protocol.PHASE_OFFLINE,
+                health_protocol.ERROR_SHUTDOWN,
+                health_protocol.LINK_CONNECTED,
+            )
             raise
     finally:
         await _cleanup_connected_bridge(casa, handles)
+        # After cleanup: the heartbeat task is gone, so nothing can publish an
+        # older ``ready`` over this final status.
+        if health is not None and final_status is not None:
+            await _publish_final_status(health, client, diagnostics, final_status)
 
 
-async def main(*, sleep: Any = asyncio.sleep) -> None:
+async def _run_bridge_until_stopped() -> None:
+    """
+    Run main() with SIGTERM mapped to a clean, cancelling shutdown.
+
+    Python's default SIGTERM action kills the process without unwinding, so
+    systemd's stop would skip the BLE disconnect and the final ``offline``
+    status. With this handler a stop cancels main(), runs its normal cleanup
+    and exits 0 -- whichever phase (discovery, connect, session) it was in.
+    """
+    loop = asyncio.get_running_loop()
+    task = asyncio.current_task()
+    stop_requested = False
+
+    def on_sigterm() -> None:
+        nonlocal stop_requested
+        stop_requested = True
+        if task is not None:
+            task.cancel()
+
+    installed = False
+    with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
+        loop.add_signal_handler(signal.SIGTERM, on_sigterm)
+        installed = True
+    try:
+        await main()
+    except asyncio.CancelledError:
+        if not stop_requested:
+            raise
+        LOGGER.info("Stopped by SIGTERM")
+    finally:
+        if installed:
+            with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
+                loop.remove_signal_handler(signal.SIGTERM)
+
+
+async def main(  # noqa: PLR0915
+    *,
+    sleep: Any = asyncio.sleep,
+    health: BridgeHealth | None = None,
+) -> None:
     if not is_valid_network_name(NETWORK_NAME):
         message = "CASAMBI_NETWORK_NAME must be one literal, non-empty MQTT topic level"
         raise RuntimeError(message)
-
+    heartbeat_seconds = health_heartbeat_seconds()
+    health = health or BridgeHealth()
+    health.set_phase(health_protocol.PHASE_DISCOVERING)
     devices = await discover()
     device: BLEDevice | None = configured_network_device(devices)
 
@@ -1105,6 +1618,7 @@ async def main(*, sleep: Any = asyncio.sleep) -> None:
     casa = create_casambi_connection()
     disconnected = asyncio.Event()
     disconnect_registered = False
+    health.set_phase(health_protocol.PHASE_CONNECTING)
     try:
         await casa.connect(device, NETWORK_PASSWORD)
         LOGGER.info("Connected to Casambi network")
@@ -1129,7 +1643,16 @@ async def main(*, sleep: Any = asyncio.sleep) -> None:
             raise CasambiDisconnected
 
         client = aiomqtt.Client(
-            MQTT_BROKER, port=MQTT_PORT, username=MQTT_USERNAME, password=MQTT_PASSWORD
+            MQTT_BROKER,
+            port=MQTT_PORT,
+            username=MQTT_USERNAME,
+            password=MQTT_PASSWORD,
+            will=aiomqtt.Will(
+                health_protocol.status_topic(TOPIC_PREFIX, NETWORK_NAME),
+                payload=health.will_payload(),
+                qos=1,
+                retain=True,
+            ),
         )
         interval = 5
 
@@ -1138,7 +1661,13 @@ async def main(*, sleep: Any = asyncio.sleep) -> None:
                 raise CasambiDisconnected
             try:
                 async with client:
-                    await run_connected_bridge(casa, client, disconnected)
+                    await run_connected_bridge(
+                        casa,
+                        client,
+                        disconnected,
+                        health,
+                        heartbeat_seconds=heartbeat_seconds,
+                    )
             except aiomqtt.MqttError as e:
                 # A BLE loss must never be retried as an MQTT reconnect: an
                 # MqttError arriving here can be the MQTT-level symptom of
@@ -1148,6 +1677,10 @@ async def main(*, sleep: Any = asyncio.sleep) -> None:
                 # hiccup.
                 if disconnected.is_set():
                     raise CasambiDisconnected from None
+                health.mqtt = health_protocol.LINK_DISCONNECTED
+                health.set_phase(
+                    health_protocol.PHASE_DEGRADED, health_protocol.ERROR_MQTT
+                )
                 LOGGER.warning(
                     "Connection lost (%s); Reconnecting in %d seconds ...", e, interval
                 )
@@ -1169,7 +1702,7 @@ def cli(argv: list[str] | None = None) -> int:
     if args != ["switch-event-probe"]:
         configure_logging()
         try:
-            asyncio.run(main())
+            asyncio.run(_run_bridge_until_stopped())
         except CasambiDisconnected:
             return EXIT_BLE_DISCONNECTED
         return 0

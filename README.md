@@ -6,6 +6,12 @@ A local-push Home Assistant integration for Casambi networks. A separate Bluetoo
 
 ## Release notes
 
+### Unreleased
+
+- Adds the versioned, non-actuating bridge health protocol v1 (`casambi/<network>/status`, `casambi/<network>/health/reply`, `GET_STATUS`, and a correlated `PUBLISH_ENTITIES` snapshot). See [docs/health-protocol.md](docs/health-protocol.md) for topics, minimum ACLs, what it does and does not prove, and rollback.
+- The Home Assistant component observes bridge freshness and whether its own unit consumer still handles messages, and reports it in the config entry's diagnostics. It takes no recovery action yet.
+- The bridge maps SIGTERM to a clean shutdown and registers a retained `offline` last will. Existing topics, payloads, commands and entity identities are unchanged.
+
 ### 0.2.9
 
 - Hardens the Bluetooth bridge against silent Casambi BLE disconnects: it exits for supervisor restart instead of remaining active without updates.
@@ -83,7 +89,7 @@ python -m pip install -r requirements-server.txt
 cp .env.example .env
 ```
 
-Set the required MQTT and Casambi values in the local `.env` file. Keep it private: do not commit it or paste its contents into issues. Then start the bridge:
+Set the required MQTT and Casambi values in the local `.env` file. `HEALTH_HEARTBEAT_SECONDS` (default 30, valid 5–300) sets the status heartbeat interval. Keep it private: do not commit it or paste its contents into issues. Then start the bridge:
 
 ```bash
 python server.py
@@ -159,7 +165,7 @@ Some Casambi units do not expose a usable Bluetooth address. For those units, th
 
 ```bash
 python -m pip install -r requirements-server.txt -r requirements-dev.txt
-pytest -q tests/test_server.py
+pytest -q tests/test_server.py tests/test_switch_decoder.py tests/test_bridge_lifecycle.py tests/test_bridge_health.py
 ```
 
 ### Home Assistant component tests
@@ -170,7 +176,7 @@ The component test environment is intentionally separate from the bridge depende
 uv venv --python 3.13 .venv-ha-test
 . .venv-ha-test/bin/activate
 python -m pip install -r requirements-test.txt
-pytest -q tests/test_light.py tests/test_integration.py tests/test_migration.py -o asyncio_mode=auto
+pytest -q tests/test_light.py tests/test_integration.py tests/test_migration.py tests/test_switch_events.py tests/test_device_trigger_discovery.py tests/test_target_trigger_discovery.py tests/test_health.py -o asyncio_mode=auto
 ```
 
 CI runs bridge tests, component tests, Ruff, Hassfest, and HACS validation on every pull request.
@@ -179,6 +185,7 @@ CI runs bridge tests, component tests, Ruff, Hassfest, and HACS validation on ev
 
 - Do not use test or troubleshooting commands that actuate Casambi units unless you explicitly intend to control them.
 - A safe state-only bridge refresh is the MQTT command `{"action":"PUBLISH_ENTITIES"}`.
+- Health checks use only `GET_STATUS` and the correlated snapshot described in [docs/health-protocol.md](docs/health-protocol.md); neither controls a unit.
 - Do not commit `.env`, Casambi Bluetooth state, credentials, tokens, or hardware-local data.
 
 ## License
