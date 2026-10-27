@@ -88,7 +88,7 @@
     },
     "bridge_unsupported": {
       "title": "Casambi MQTT bridge does not report health",
-      "description": "The Casambi bridge does not answer the health protocol. Lights, scenes and switches keep working, but stuck updates cannot be detected or recovered. Update the bridge on its Bluetooth host to the release that matches this integration."
+      "description": "The Casambi bridge does not answer the health protocol. Either it is an older bridge, or it is not running at the moment; the two cannot be told apart until it answers. Lights, scenes and switches of an older bridge keep working, but stuck updates cannot be detected or recovered. If the bridge is running, update it on its Bluetooth host to the release that matches this integration. This notice disappears by itself once the bridge answers."
     }
   }
 }

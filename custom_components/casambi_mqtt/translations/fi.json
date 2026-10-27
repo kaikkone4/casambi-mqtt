@@ -88,7 +88,7 @@
     },
     "bridge_unsupported": {
       "title": "Casambi MQTT -silta ei raportoi terveystilaa",
-      "description": "Casambi-silta ei vastaa terveysprotokollaan. Valot, scenet ja kytkimet toimivat edelleen, mutta jumittuneita päivityksiä ei voida havaita eikä palauttaa. Päivitä Bluetooth-isännän silta tätä integraatiota vastaavaan julkaisuun."
+      "description": "Casambi-silta ei vastaa terveysprotokollaan. Se on joko vanhempi silta tai ei ole juuri nyt käynnissä; näitä ei voi erottaa ennen kuin silta vastaa. Vanhemman sillan valot, scenet ja kytkimet toimivat edelleen, mutta jumittuneita päivityksiä ei voida havaita eikä palauttaa. Jos silta on käynnissä, päivitä se Bluetooth-isännällä tätä integraatiota vastaavaan julkaisuun. Ilmoitus poistuu itsestään, kun silta vastaa."
     }
   }
 }

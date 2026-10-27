@@ -173,7 +173,7 @@ Each Casambi MQTT config entry watches its own processing of unit messages (see 
 | `consumer_stale` | the bridge confirmed a snapshot and the messages reached Home Assistant, but this entry handled **none** of them | after a second consecutive proof 90 s or more later: reload this entry (unless disabled) |
 | `recovering` | a reload of this entry is running and being verified | — |
 | `recovery_failed` | the reload budget is spent or a reload could not be verified | none until acknowledged |
-| `unsupported` | the bridge does not answer the health protocol (older bridge) | none; a repair notice explains the update |
+| `unsupported` | the bridge does not answer the health protocol: an older bridge, or a bridge that is not running when Home Assistant starts (the two cannot be told apart until it answers) | none; a repair notice explains the update and clears itself when the bridge answers |
 
 How recovery works:
 
