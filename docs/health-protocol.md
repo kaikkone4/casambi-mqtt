@@ -132,8 +132,10 @@ Home Assistant uses the **local monotonic receipt time** of each message.
 - A **retained** status is history (it is replayed on every subscribe and
   reconnect) and never makes the bridge healthy.
 - A status from an instance that has already been replaced, or a
-  non-increasing `sequence` of the current instance, is ignored. After an
-  instance's last will (`offline`), only a **new** instance can be live again.
+  non-increasing `sequence` of the current instance, is ignored. The last will
+  has no sequence and never lowers the highest one seen, so after an `offline`
+  only a newer heartbeat -- the same process after an MQTT reconnect, or a new
+  process -- is live again.
 - `healthy` needs a live `ready` status received within the stale limit
   (default **120 s**). Within the startup grace (default **90 s**) without
   live status the bridge is `starting`, not failed.

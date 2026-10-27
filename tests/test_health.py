@@ -172,18 +172,19 @@ def test_rolled_back_bridge_with_leftover_retained_status_is_unsupported():
     assert obs.bridge_state() is BridgeState.UNSUPPORTED
 
 
-def test_older_heartbeat_after_last_will_cannot_restore_healthy():
+def test_older_heartbeat_after_last_will_cannot_restore_healthy_but_reconnect_can():
     clock = FakeClock()
     obs = observer(clock)
     obs.on_status(status(sequence=50).to_json(), retain=False)
     will = status(phase=hp.PHASE_OFFLINE, error=hp.ERROR_CONNECTION_LOST)
     obs.on_status(json.dumps(will.as_dict() | {"sequence": None}), retain=False)
     assert obs.bridge_state() is BridgeState.UNAVAILABLE
-    for sequence in (3, 50, 51):
+    for sequence in (3, 50):
         obs.on_status(status(sequence=sequence).to_json(), retain=False)
         assert obs.bridge_state() is BridgeState.UNAVAILABLE
-    # Only a new process can be live again.
-    obs.on_status(status(INSTANCE_B, sequence=1).to_json(), retain=False)
+    # The same process reconnecting to MQTT continues its sequence and is
+    # live again; only older or repeated heartbeats are rejected.
+    obs.on_status(status(sequence=51).to_json(), retain=False)
     assert obs.bridge_state() is BridgeState.HEALTHY
 
 
@@ -711,4 +712,27 @@ async def test_options_flow_validates_health_settings(hass, mqtt_mock):
     await hass.async_block_till_done()
     # The options change reloaded only this entry with the new settings.
     assert entry.runtime_data.health.settings.stale_seconds == 300
+    assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expected_lingering_timers", [True])
+async def test_network_rename_sets_the_entry_up_once_with_new_options(hass, mqtt_mock):
+    entry = await setup_entry(hass, FakeClock())
+    setups = []
+    real_setup = integration.async_setup_entry
+
+    async def counting_setup(hass_arg, entry_arg):
+        setups.append(dict(entry_arg.options))
+        return await real_setup(hass_arg, entry_arg)
+
+    with patch.object(integration, "async_setup_entry", counting_setup):
+        flow = await hass.config_entries.options.async_init(entry.entry_id)
+        await hass.config_entries.options.async_configure(
+            flow["flow_id"], {CONF_NETWORK_NAME: "renamed"}
+        )
+        await hass.async_block_till_done()
+
+    assert len(setups) == 1
+    assert setups[0][CONF_NETWORK_NAME] == "renamed"
     assert await hass.config_entries.async_unload(entry.entry_id)

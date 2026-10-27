@@ -137,7 +137,7 @@ class BridgeStatusTracker:
     def instance_id(self) -> str | None:
         return None if self.status is None else self.status.instance_id
 
-    def on_message(self, payload: str | bytes, *, retain: bool, now: float) -> bool:  # noqa: PLR0911
+    def on_message(self, payload: str | bytes, *, retain: bool, now: float) -> bool:
         """Record one status message; return whether it was accepted as live."""
         version = hp.protocol_version_of(payload)
         if version is not None and version != hp.PROTOCOL_VERSION:
@@ -155,10 +155,6 @@ class BridgeStatusTracker:
             return False
         current = self.status
         if current is not None and status.instance_id == current.instance_id:
-            if current.phase == hp.PHASE_OFFLINE and status.sequence is not None:
-                # After the last will, only a NEW instance can be live again.
-                self.ignored += 1
-                return False
             if (
                 status.sequence is not None
                 and self._max_sequence is not None
