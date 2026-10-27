@@ -90,7 +90,7 @@ refuse to start (exit 78).
 |---|---|---|
 | `RECOVERY_BRIDGE_UNIT` | `casambi-mqtt.service` | plain `*.service` name, not `bluetooth.service` |
 | `RECOVERY_HEALTH_RECORD` | `/run/casambi-mqtt/health.json` | absolute path |
-| `RECOVERY_STATE_DIR` | `/var/lib/casambi-mqtt-recovery` | absolute path |
+| `RECOVERY_STATE_DIR` | `/var/lib/casambi-mqtt-recovery` | absolute path; set the same value in the bridge unit's `ExecStopPost=` line, or no exit is ever counted |
 | `RECOVERY_FAILURES_TO_RESET` | 2 | 2–10 |
 | `RECOVERY_FAILURE_WINDOW_SECONDS` | 600 | 60–86400 |
 | `RECOVERY_MAX_RESETS_SHORT` / `_SHORT_WINDOW_SECONDS` | 1 / 600 | 1–5 / 300–86400 |

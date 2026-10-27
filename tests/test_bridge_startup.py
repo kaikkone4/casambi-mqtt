@@ -605,3 +605,47 @@ async def test_wedged_disconnect_after_connect_exits_75_not_76(server, monkeypat
         await asyncio.sleep(0)
     # A lost link after a successful connect is never a startup failure.
     assert exits == [server.EXIT_BLE_DISCONNECTED]
+
+
+
+@pytest.mark.asyncio
+async def test_requested_stop_with_wedged_disconnect_exits_cleanly(server, monkeypatch):
+    monkeypatch.setattr(server, "BLE_CLEANUP_TIMEOUT", 0.01)
+    monkeypatch.setattr(server, "BLE_CANCEL_GRACE", 0.01)
+    exits = []
+
+    class Exited(BaseException):
+        pass
+
+    def hard_exit(code):
+        exits.append(code)
+        raise Exited
+
+    reached = asyncio.Event()
+    release = asyncio.Event()
+
+    async def discover():
+        return [DEVICE]
+
+    async def connect():
+        reached.set()
+        await asyncio.Future()
+
+    class WedgedDisconnectCasa(FakeCasa):
+        async def disconnect(self):
+            await stubborn(release)()
+
+    monkeypatch.setattr(server, "_hard_exit", hard_exit)
+    patch_bridge(
+        server, monkeypatch, discover=discover, casa=WedgedDisconnectCasa(connect)
+    )
+    task = asyncio.create_task(server.main(sleep=Sleeps(), health=server.BridgeHealth()))
+    await asyncio.wait_for(reached.wait(), timeout=5)
+    task.cancel()  # SIGTERM from systemd (the supervisor's or an admin's stop)
+    try:
+        with pytest.raises(Exited):
+            await asyncio.wait_for(task, timeout=5)
+    finally:
+        release.set()
+        await asyncio.sleep(0)
+    assert exits == [0]

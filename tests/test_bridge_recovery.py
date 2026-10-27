@@ -713,3 +713,25 @@ def test_main_record_exit_never_fails_the_stop(rec, settings, monkeypatch):
     assert len(rec.consume_exits(settings)) == 1
     monkeypatch.setenv("EXIT_STATUS", "bad value")
     assert rec.main(["record-exit"]) == 0
+
+
+def test_exit_caused_by_the_recovery_stop_is_not_a_failure(rec, settings):
+    fake = FakeClock(rec)
+    manager = FakeManager(rec, settings, fake)
+    holder = {}
+    reader = ready_after_start(rec, manager, holder)
+    real_action = manager.action
+
+    def action(verb, unit, timeout):
+        real_action(verb, unit, timeout)
+        if verb == "stop" and unit == BRIDGE:
+            # Worst case: the stopped bridge's disconnect wedged and it left 76.
+            rec.record_exit(
+                settings, {"EXIT_CODE": "exited", "EXIT_STATUS": "76"}, fake.clock
+            )
+
+    manager.action = action
+    assert ble_loop(rec, settings, manager, fake, reader=reader) == "recovered"
+    fake.advance(60)
+    run(rec, settings, manager, fake, reader)
+    assert rec.load_state(settings).ble_failures == []

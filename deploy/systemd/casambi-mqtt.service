@@ -30,7 +30,8 @@ RestartPreventExitStatus=78
 # "+" runs this one hook as root: systemd passes the real exit in
 # $EXIT_CODE/$EXIT_STATUS for every exit, including each automatic restart,
 # and the root-owned supervisor counts BLE startup failures (76) from it.
-ExecStopPost=+/usr/bin/python3 -I /usr/local/libexec/casambi-mqtt/bridge_recovery.py record-exit
+# RECOVERY_STATE_DIR must match casambi-mqtt-recovery.service.
+ExecStopPost=+/usr/bin/env RECOVERY_STATE_DIR=/var/lib/casambi-mqtt-recovery /usr/bin/python3 -I /usr/local/libexec/casambi-mqtt/bridge_recovery.py record-exit
 # SIGTERM runs the bridge's normal cleanup (BLE disconnect, offline status).
 TimeoutStopSec=30
 RuntimeDirectory=casambi-mqtt

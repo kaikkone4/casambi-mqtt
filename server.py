@@ -2050,7 +2050,7 @@ async def _discover_configured_device(health: BridgeHealth, sleep: Any) -> Any:
     return None
 
 
-async def _main(health: BridgeHealth, sleep: Any) -> None:  # noqa: PLR0915
+async def _main(health: BridgeHealth, sleep: Any) -> None:  # noqa: PLR0912, PLR0915
     if not is_valid_network_name(NETWORK_NAME):
         message = "CASAMBI_NETWORK_NAME must be one literal, non-empty MQTT topic level"
         raise BridgeConfigurationError(message)
@@ -2063,6 +2063,7 @@ async def _main(health: BridgeHealth, sleep: Any) -> None:  # noqa: PLR0915
     disconnected = asyncio.Event()
     disconnect_registered = False
     connected = False
+    stopping = False
     try:
         await run_startup_stage(
             health_protocol.PHASE_CONNECTING,
@@ -2129,8 +2130,12 @@ async def _main(health: BridgeHealth, sleep: Any) -> None:  # noqa: PLR0915
                 await sleep(interval)
             except asyncio.CancelledError:
                 LOGGER.info("Main task cancelled, waiting for cleanup")
+                stopping = True
                 break
 
+    except asyncio.CancelledError:
+        stopping = True
+        raise
     finally:
         if disconnect_registered:
             casa.unregisterDisconnectCallback(on_ble_disconnect)
@@ -2139,8 +2144,11 @@ async def _main(health: BridgeHealth, sleep: Any) -> None:  # noqa: PLR0915
             await _bounded_cleanup(casa.disconnect())
         except _BleWedgedError:
             LOGGER.error("Casambi BLE disconnect did not stop; exiting")  # noqa: TRY400
-            # Once connected this is a lost link (75), never a startup
-            # failure (76) that would count towards a Bluetooth reset.
+            # A requested stop is a clean exit (0); once connected this is a
+            # lost link (75). Only a failure before the first connect is a
+            # startup failure (76) that counts towards a Bluetooth reset.
+            if stopping:
+                _hard_exit(0)
             _hard_exit(EXIT_BLE_DISCONNECTED if connected else EXIT_BLE_STARTUP_FAILED)
 
 

@@ -829,6 +829,9 @@ def recover(  # noqa: PLR0913
             settings.poll_interval,
         ):
             return fail("bridge_stop_timeout")
+        # The exit caused by this stop was requested here, not a failure:
+        # drop whatever the exit hook just recorded for it.
+        consume_exits(settings)
         manager.action("restart", BLUETOOTH_UNIT, settings.stop_timeout)
         if not _wait_until(
             lambda: manager.show(BLUETOOTH_UNIT).get("ActiveState") == "active",
