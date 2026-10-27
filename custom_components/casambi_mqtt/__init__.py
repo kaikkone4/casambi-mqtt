@@ -246,7 +246,9 @@ async def async_setup_entry(  # noqa: PLR0915
     hass: HomeAssistant, entry: ConfigEntry
 ) -> bool:
     network_name = configured_network_name(entry.options, entry.data)
-    entry.runtime_data = CasambiMqttRuntimeData(network_name=network_name)
+    entry.runtime_data = CasambiMqttRuntimeData(
+        network_name=network_name, applied_options=dict(entry.options)
+    )
     switch_store = Store(
         hass, SWITCH_STORE_VERSION, f"{DOMAIN}.{entry.entry_id}.switch_buttons"
     )
@@ -416,6 +418,10 @@ async def async_setup_entry(  # noqa: PLR0915
 
 
 async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    # The options flow also updates the unique ID, which fires this listener
+    # once more with the old options; only a real options change reloads.
+    if dict(entry.options) == entry.runtime_data.applied_options:
+        return
     await hass.config_entries.async_reload(entry.entry_id)
 
 

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from time import monotonic
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from homeassistant.helpers.entity_platform import AddEntitiesCallback
@@ -22,6 +22,7 @@ class CasambiMqttRuntimeData:
     """Runtime state isolated to one config entry."""
 
     network_name: str
+    applied_options: dict[str, Any] = field(default_factory=dict)
     light_add_entities: AddEntitiesCallback | None = None
     scene_add_entities: AddEntitiesCallback | None = None
     event_add_entities: AddEntitiesCallback | None = None
