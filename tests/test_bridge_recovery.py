@@ -67,8 +67,10 @@ class FakeClock:
 class FakeManager:
     """Records systemctl calls; simulates the bridge unit's systemd counters."""
 
-    def __init__(self, rec, *, fail_verb=None, stop_hangs=False):
+    def __init__(self, rec, settings, fake, *, fail_verb=None, stop_hangs=False):
         self.rec = rec
+        self.settings = settings
+        self.fake = fake
         self.calls = []
         self.fail_verb = fail_verb
         self.stop_hangs = stop_hangs
@@ -82,13 +84,25 @@ class FakeManager:
 
     # -- simulated bridge lifecycle -------------------------------------
     def bridge_exits(self, status, *, restarted=True):
-        self.exec_main_status = status
+        """
+        One bridge exit as systemd handles it: ExecStopPost=+ reports it,
+        then either an automatic restart (which CLEARS ExecMainStatus, as
+        the real systemd does) or giving up with the status kept.
+        """
+        assert self.rec.record_exit(
+            self.settings,
+            {"EXIT_CODE": "exited", "EXIT_STATUS": str(status)},
+            self.fake.clock,
+        )
         self.exec_main_pid = self.main_pid
         if restarted:
             self.n_restarts += 1
             self.main_pid += 1
-            self.active = "activating"
+            self.exec_main_status = 0
+            self.active = "active"
         else:
+            self.n_restarts += 1  # systemd counts the attempt before refusing
+            self.exec_main_status = status
             self.main_pid = 0
             self.active = "failed"
             self.result = "start-limit-hit"
@@ -274,7 +288,7 @@ def test_record_reader_refuses_symlinks_and_fifos(rec, tmp_path):
 
 def test_repeated_ble_exits_do_exactly_stop_restart_start(rec, settings):
     fake = FakeClock(rec)
-    manager = FakeManager(rec)
+    manager = FakeManager(rec, settings, fake)
     holder = {}
     reader = ready_after_start(rec, manager, holder)
 
@@ -293,7 +307,7 @@ def test_repeated_ble_exits_do_exactly_stop_restart_start(rec, settings):
 
 def test_failures_missed_between_timer_runs_are_still_counted(rec, settings):
     fake = FakeClock(rec)
-    manager = FakeManager(rec)
+    manager = FakeManager(rec, settings, fake)
     holder = {}
     reader = ready_after_start(rec, manager, holder)
     manager.bridge_exits(76)
@@ -305,7 +319,7 @@ def test_failures_missed_between_timer_runs_are_still_counted(rec, settings):
 
 def test_start_limit_hit_bridge_is_recovered_and_reset_failed(rec, settings):
     fake = FakeClock(rec)
-    manager = FakeManager(rec)
+    manager = FakeManager(rec, settings, fake)
     holder = {}
     reader = ready_after_start(rec, manager, holder)
     manager.bridge_exits(76)
@@ -325,7 +339,7 @@ def test_start_limit_hit_bridge_is_recovered_and_reset_failed(rec, settings):
 
 def test_same_exit_is_never_counted_twice(rec, settings):
     fake = FakeClock(rec)
-    manager = FakeManager(rec)
+    manager = FakeManager(rec, settings, fake)
     manager.bridge_exits(76)
     for _ in range(5):
         fake.advance(60)
@@ -337,7 +351,7 @@ def test_same_exit_is_never_counted_twice(rec, settings):
 @pytest.mark.parametrize("status", [75, 78, 79, 1, 0])
 def test_non_ble_exits_never_reset_bluetooth(rec, settings, status):
     fake = FakeClock(rec)
-    manager = FakeManager(rec)
+    manager = FakeManager(rec, settings, fake)
     for _ in range(6):
         manager.bridge_exits(status)
         fake.advance(70)
@@ -347,7 +361,7 @@ def test_non_ble_exits_never_reset_bluetooth(rec, settings, status):
 
 def test_mqtt_outage_and_ha_consumer_fault_never_reset(rec, settings):
     fake = FakeClock(rec)
-    manager = FakeManager(rec)
+    manager = FakeManager(rec, settings, fake)
     # The bridge stays up and reports ready (MQTT reconnects are internal;
     # Home Assistant consumer faults are invisible here).
     reader = lambda: record(rec, manager, NEW, phase="ready")  # noqa: E731
@@ -359,7 +373,7 @@ def test_mqtt_outage_and_ha_consumer_fault_never_reset(rec, settings):
 
 def test_forged_record_of_another_process_is_ignored(rec, settings):
     fake = FakeClock(rec)
-    manager = FakeManager(rec)
+    manager = FakeManager(rec, settings, fake)
     rec.save_state(settings, rec.State(recovery_failed=True, reason="budget_exhausted"))
     # pid 1 really exists and its start time matches, but it is not MainPID.
     forged = lambda: record(rec, manager, NEW, phase="ready", pid=1)  # noqa: E731
@@ -371,7 +385,7 @@ def test_forged_record_of_another_process_is_ignored(rec, settings):
 
 def test_latch_clears_only_after_the_supervisor_observed_a_long_ready(rec, settings):
     fake = FakeClock(rec)
-    manager = FakeManager(rec)
+    manager = FakeManager(rec, settings, fake)
     rec.save_state(settings, rec.State(recovery_failed=True, reason="budget_exhausted"))
     ready = lambda: record(rec, manager, NEW, phase="ready")  # noqa: E731
     run(rec, settings, manager, fake, ready)
@@ -385,7 +399,7 @@ def test_latch_clears_only_after_the_supervisor_observed_a_long_ready(rec, setti
 
 def test_new_process_does_not_refill_the_budget(rec, settings):
     fake = FakeClock(rec)
-    manager = FakeManager(rec)
+    manager = FakeManager(rec, settings, fake)
     holder = {}
     reader = ready_after_start(rec, manager, holder)
     assert ble_loop(rec, settings, manager, fake, reader=reader) == "recovered"
@@ -402,7 +416,7 @@ def test_new_process_does_not_refill_the_budget(rec, settings):
 
 def test_two_resets_per_thirty_minutes_then_latch(rec, settings):
     fake = FakeClock(rec)
-    manager = FakeManager(rec)
+    manager = FakeManager(rec, settings, fake)
     holder = {}
     results = []
     for _ in range(3):
@@ -418,7 +432,7 @@ def test_two_resets_per_thirty_minutes_then_latch(rec, settings):
 
 def test_forward_clock_jump_does_not_refill_the_budget(rec, settings):
     fake = FakeClock(rec)
-    manager = FakeManager(rec)
+    manager = FakeManager(rec, settings, fake)
     holder = {}
     assert (
         ble_loop(rec, settings, manager, fake, reader=ready_after_start(rec, manager, holder))
@@ -433,7 +447,7 @@ def test_forward_clock_jump_does_not_refill_the_budget(rec, settings):
 
 def test_failure_mid_recovery_is_recovery_failed_and_restarts_bridge(rec, settings):
     fake = FakeClock(rec)
-    manager = FakeManager(rec, fail_verb="restart")
+    manager = FakeManager(rec, settings, fake, fail_verb="restart")
 
     assert ble_loop(rec, settings, manager, fake) == "recovery_failed"
     assert manager.mutations == [
@@ -448,7 +462,7 @@ def test_failure_mid_recovery_is_recovery_failed_and_restarts_bridge(rec, settin
 
 def test_bridge_that_does_not_stop_blocks_bluetooth_reset(rec, settings):
     fake = FakeClock(rec)
-    manager = FakeManager(rec, stop_hangs=True)
+    manager = FakeManager(rec, settings, fake, stop_hangs=True)
 
     assert ble_loop(rec, settings, manager, fake) == "recovery_failed"
     assert ("restart", BT) not in manager.calls
@@ -457,7 +471,7 @@ def test_bridge_that_does_not_stop_blocks_bluetooth_reset(rec, settings):
 
 def test_unverified_recovery_is_not_success(rec, settings):
     fake = FakeClock(rec)
-    manager = FakeManager(rec)
+    manager = FakeManager(rec, settings, fake)
     still_failing = lambda: record(rec, manager, NEW, phase="discovering")  # noqa: E731
 
     assert ble_loop(rec, settings, manager, fake, reader=still_failing) == "verify_failed"
@@ -468,7 +482,7 @@ def test_unverified_recovery_is_not_success(rec, settings):
 
 def test_ready_record_of_a_different_process_never_verifies(rec, settings):
     fake = FakeClock(rec)
-    manager = FakeManager(rec)
+    manager = FakeManager(rec, settings, fake)
     stale = lambda: record(rec, manager, NEW, phase="ready", pid=4242)  # noqa: E731
 
     assert ble_loop(rec, settings, manager, fake, reader=stale) == "verify_failed"
@@ -476,7 +490,7 @@ def test_ready_record_of_a_different_process_never_verifies(rec, settings):
 
 def test_live_process_stuck_in_discovery_counts_as_ble_failure(rec, settings):
     fake = FakeClock(rec)
-    manager = FakeManager(rec)
+    manager = FakeManager(rec, settings, fake)
     holder = {}
     stuck = {"record": record(rec, manager, OLD, updated=fake.mono_now)}
 
@@ -486,11 +500,11 @@ def test_live_process_stuck_in_discovery_counts_as_ble_failure(rec, settings):
     manager.after_start = lambda: holder.update(
         record=record(rec, manager, NEW, phase="ready")
     )
-    fake.advance(rec.STUCK_SECONDS + 1)
-    run(rec, settings, manager, fake, reader)
-    assert len(rec.load_state(settings).ble_failures) == 1
-    manager.bridge_exits(76)
-    fake.advance(70)
+    fake.advance(rec.STUCK_SECONDS - 10)
+    assert run(rec, settings, manager, fake, reader) == "no_repeated_ble_failure"
+    fake.advance(11)
+    # A process stuck that long has missed many retry cycles: that alone is
+    # a repeated fault, and it never exits on its own to add more evidence.
     assert run(rec, settings, manager, fake, reader) == "recovered"
 
 
@@ -498,7 +512,7 @@ def test_bridge_systemd_gave_up_on_for_other_reasons_gets_one_plain_restart(
     rec, settings
 ):
     fake = FakeClock(rec)
-    manager = FakeManager(rec)
+    manager = FakeManager(rec, settings, fake)
     manager.bridge_exits(79, restarted=False)  # e.g. network not found
     assert run(rec, settings, manager, fake) == "bridge_restarted"
     assert manager.mutations == [("reset-failed", BRIDGE), ("start", BRIDGE)]
@@ -512,7 +526,7 @@ def test_bridge_systemd_gave_up_on_for_other_reasons_gets_one_plain_restart(
 
 def test_configuration_failure_is_never_restarted(rec, settings):
     fake = FakeClock(rec)
-    manager = FakeManager(rec)
+    manager = FakeManager(rec, settings, fake)
     manager.bridge_exits(78, restarted=False)
     for _ in range(5):
         fake.advance(3600)
@@ -524,7 +538,7 @@ def test_corrupt_state_fails_closed(rec, settings):
     settings.state_dir.mkdir()
     (settings.state_dir / "state.json").write_text("{not json")
     fake = FakeClock(rec)
-    manager = FakeManager(rec)
+    manager = FakeManager(rec, settings, fake)
 
     ble_loop(rec, settings, manager, fake, exits=4)
 
@@ -538,12 +552,13 @@ def test_corrupt_state_fails_closed(rec, settings):
 
 
 def test_held_lock_means_no_second_operation(rec, settings):
-    manager = FakeManager(rec)
+    fake = FakeClock(rec)
+    manager = FakeManager(rec, settings, fake)
     manager.bridge_exits(76)
     manager.bridge_exits(76)
     with rec.exclusive_lock(settings) as acquired:
         assert acquired
-        result = run(rec, settings, manager, FakeClock(rec))
+        result = run(rec, settings, manager, fake)
     assert result == "locked"
     assert manager.calls == []
 
@@ -560,7 +575,7 @@ def test_concurrent_failure_and_timer_triggers_produce_one_recovery(rec, setting
                 gate.wait(5)
             super().action(verb, unit, timeout)
 
-    manager = BlockingManager(rec)
+    manager = BlockingManager(rec, settings, fake)
     holder = {}
     reader = ready_after_start(rec, manager, holder)
     manager.bridge_exits(76)
@@ -596,14 +611,14 @@ def test_systemctl_wrapper_uses_fixed_argv_and_allowlist(rec):
     def run_fake(argv, **kwargs):
         calls.append((argv, kwargs))
         return subprocess.CompletedProcess(
-            argv, 0, stdout="MainPID=0\nNRestarts=4\nOther=x\n"
+            argv, 0, stdout="MainPID=0\nExecMainStatus=76\nOther=x\n"
         )
 
     manager = rec.Systemctl(
         frozenset({BRIDGE, BT}), run=run_fake, executable="/usr/bin/systemctl"
     )
     manager.action("restart", BT, 5)
-    assert manager.show(BRIDGE) == {"MainPID": "0", "NRestarts": "4"}
+    assert manager.show(BRIDGE) == {"MainPID": "0", "ExecMainStatus": "76"}
     for verb, unit in (
         ("restart", "ssh.service"),
         ("restart", "bluetooth.service; reboot"),
@@ -637,7 +652,7 @@ def test_unreadable_unit_state_does_nothing(rec, settings):
         def show(self, unit):
             raise self.rec.ServiceManagerError("show")
 
-    manager = Broken(rec)
+    manager = Broken(rec, settings, FakeClock(rec))
     assert run(rec, settings, manager, FakeClock(rec)) == "systemd_unavailable"
     assert manager.calls == []
 
@@ -652,3 +667,49 @@ def test_operator_reset_clears_the_latch(rec, settings, monkeypatch):
     state = rec.load_state(settings)
     assert state.recovery_failed is False
     assert state.last_result == "operator_reset"
+
+
+def test_exit_hook_rejects_unknown_values(rec, settings):
+    fake = FakeClock(rec)
+    for env in (
+        {},
+        {"EXIT_CODE": "exited"},
+        {"EXIT_CODE": "exited", "EXIT_STATUS": "76; reboot"},
+        {"EXIT_CODE": "weird", "EXIT_STATUS": "76"},
+        {"EXIT_CODE": "exited", "EXIT_STATUS": "x" * 40},
+    ):
+        assert rec.record_exit(settings, env, fake.clock) is False
+    assert rec.consume_exits(settings) == []
+
+
+def test_signal_exits_are_never_ble_failures(rec, settings):
+    fake = FakeClock(rec)
+    manager = FakeManager(rec, settings, fake)
+    for _ in range(4):
+        rec.record_exit(settings, {"EXIT_CODE": "killed", "EXIT_STATUS": "TERM"}, fake.clock)
+        fake.advance(70)
+        run(rec, settings, manager, fake)
+    assert manager.calls == []
+
+
+def test_final_exit_before_start_limit_is_counted_once(rec, settings):
+    fake = FakeClock(rec)
+    manager = FakeManager(rec, settings, fake)
+    for _ in range(4):
+        manager.bridge_exits(1)
+    manager.bridge_exits(76, restarted=False)
+    fake.advance(70)
+    # A single BLE failure (with four unrelated ones) is not a repeated BLE fault.
+    assert run(rec, settings, manager, fake) == "bridge_restarted"
+    assert ("restart", BT) not in manager.calls
+    assert len(rec.load_state(settings).ble_failures) == 1
+
+
+def test_main_record_exit_never_fails_the_stop(rec, settings, monkeypatch):
+    monkeypatch.setenv("RECOVERY_STATE_DIR", str(settings.state_dir))
+    monkeypatch.setenv("EXIT_CODE", "exited")
+    monkeypatch.setenv("EXIT_STATUS", "76")
+    assert rec.main(["record-exit"]) == 0
+    assert len(rec.consume_exits(settings)) == 1
+    monkeypatch.setenv("EXIT_STATUS", "bad value")
+    assert rec.main(["record-exit"]) == 0

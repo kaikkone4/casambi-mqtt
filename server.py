@@ -2062,6 +2062,7 @@ async def _main(health: BridgeHealth, sleep: Any) -> None:  # noqa: PLR0915
     casa = create_casambi_connection()
     disconnected = asyncio.Event()
     disconnect_registered = False
+    connected = False
     try:
         await run_startup_stage(
             health_protocol.PHASE_CONNECTING,
@@ -2072,6 +2073,7 @@ async def _main(health: BridgeHealth, sleep: Any) -> None:  # noqa: PLR0915
             cleanup=casa.disconnect,
         )
         LOGGER.info("Connected to Casambi network")
+        connected = True
 
         loop = asyncio.get_running_loop()
 
@@ -2137,7 +2139,9 @@ async def _main(health: BridgeHealth, sleep: Any) -> None:  # noqa: PLR0915
             await _bounded_cleanup(casa.disconnect())
         except _BleWedgedError:
             LOGGER.error("Casambi BLE disconnect did not stop; exiting")  # noqa: TRY400
-            _hard_exit(EXIT_BLE_STARTUP_FAILED)
+            # Once connected this is a lost link (75), never a startup
+            # failure (76) that would count towards a Bluetooth reset.
+            _hard_exit(EXIT_BLE_DISCONNECTED if connected else EXIT_BLE_STARTUP_FAILED)
 
 
 def cli(argv: list[str] | None = None) -> int:  # noqa: PLR0911

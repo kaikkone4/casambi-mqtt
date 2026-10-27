@@ -22,15 +22,17 @@ root cause.
    - A rejected Casambi login or an invalid setting is `configuration`. It is not retried, and the bridge exits with **78**.
    - Exhausted retries exit after a bounded (10 s) MQTT publish of `phase=offline` with that category, so Home Assistant can see the failure even though no normal session ever existed. Exit **76** means a BLE startup failure (`ble_discovery_in_progress`, `ble_discovery_failed`, `ble_connect_failed`); exit **79** means network not found or unclassified, which a Bluetooth reset would not fix.
    - A cancelled BLE call gets 10 s to unwind. bleak's scanner stop is a D-Bus call without a timeout, the same call that failed on 27.10.2026. If it ignores cancellation, the bridge does not stay alive and stuck: it reports the failure and leaves at once with exit 76.
-   - A lost BLE link still exits with **75**, as before.
+   - A lost BLE link still exits with **75**, as before, also when its BLE disconnect hangs and the process has to leave hard. Only a failure before the first successful connect can be 76.
    - An MQTT outage is retried inside the process. It never exits for it and never touches Bluetooth.
 2. **systemd** (`deploy/systemd/casambi-mqtt.service`):
    - `Restart=on-failure`, `RestartSec=10`, `RestartPreventExitStatus=78`.
    - `StartLimitBurst=5` within `StartLimitIntervalSec=600`. The old 10 s window never limited anything. Now about five failing processes (roughly 5–6 minutes) put the unit in `failed` instead of looping for hours.
 3. **Root-owned supervisor** (`scripts/bridge_recovery.py`, run by
    `casambi-mqtt-recovery.service` from `OnFailure=` and a 1-minute timer):
-   - It counts failures from **systemd's own bookkeeping**: `NRestarts`, `ExecMainStatus` and `ExecMainPID` from `systemctl show`. That is trusted data, and it does not depend on catching a dead process's record before the next process overwrites it. Exits missed between two timer runs are still counted, and so is the final exit when systemd gives up.
-   - A bridge process that is alive but has not progressed out of `discovering`/`connecting` for 10 minutes also counts. With the bounded unwind above this should not happen, but it is a second line of defence.
+   - It counts failures from what **systemd** reports for every single exit. The bridge unit's `ExecStopPost=+…bridge_recovery.py record-exit` runs as root after each exit, including every automatic restart and the final exit when systemd gives up. It receives systemd's own `$EXIT_CODE`/`$EXIT_STATUS` and appends them to a small root-owned exit log under its own brief lock. Each supervisor run consumes that log.
+     - This is trusted data. Nothing is lost between timer runs, and nothing is counted twice.
+     - `systemctl show` alone cannot provide this: systemd clears `ExecMainStatus` whenever it restarts the process.
+   - A bridge process that is alive but has not progressed out of `discovering`/`connecting` for 10 minutes is treated as a repeated BLE fault by itself, because it has missed many retry cycles and will not exit on its own. With the bounded unwind above this should not happen; it is a second line of defence.
    - It resets Bluetooth only after **two** BLE startup failures (exit 76) within 10 minutes, and only while the unit's current main process is not `ready`.
    - The sequence is fixed:
      1. stop the bridge;

@@ -8,10 +8,11 @@ imports code the unprivileged bridge user can modify.
 
 What it does, and nothing else:
 
-* counts bridge exits with the BLE startup exit status (76) from systemd's
-  own bookkeeping (``NRestarts``, ``ExecMainStatus``) -- trusted data the
-  unprivileged bridge cannot forge -- in root-owned state that survives
-  bridge restarts;
+* counts every bridge exit with the BLE startup exit status (76). systemd
+  reports each exit to a root ``ExecStopPost=+`` hook (``record-exit``) in
+  ``$EXIT_CODE``/``$EXIT_STATUS``; the hook appends it to a small root-owned
+  exit log, and each supervisor run consumes that log into root-owned state
+  that survives bridge restarts;
 * reads the bridge's local health record only as UNTRUSTED, advisory input,
   and only when it belongs to the unit's current main process;
 * when BLE failures repeat and the budget allows: stop the bridge, wait until
@@ -66,15 +67,10 @@ EXIT_CONFIGURATION = 78
 STUCK_SECONDS = 600
 PLAIN_RESTART_WINDOW_SECONDS = 1800
 MAX_PLAIN_RESTARTS_PER_WINDOW = 1
-UNIT_PROPERTIES = (
-    "ActiveState",
-    "SubState",
-    "MainPID",
-    "Result",
-    "ExecMainStatus",
-    "ExecMainPID",
-    "NRestarts",
-)
+UNIT_PROPERTIES = ("ActiveState", "SubState", "MainPID", "Result", "ExecMainStatus")
+EXIT_CODES = frozenset({"exited", "killed", "dumped"})
+EXIT_STATUS = re.compile(r"[A-Z0-9+]{1,16}")
+MAX_EXIT_LOG = 64
 
 # Startup failures that a Bluetooth stack reset can plausibly fix.
 BLE_STARTUP_ERRORS = frozenset(
@@ -339,8 +335,6 @@ class UnitView:
     main_pid: int
     result: str
     exec_main_status: int | None
-    exec_main_pid: int
-    n_restarts: int
 
     @classmethod
     def from_properties(cls, properties: Mapping[str, str]) -> UnitView:
@@ -355,8 +349,6 @@ class UnitView:
             main_pid=integer("MainPID") or 0,
             result=properties.get("Result", "unknown"),
             exec_main_status=integer("ExecMainStatus"),
-            exec_main_pid=integer("ExecMainPID") or 0,
-            n_restarts=integer("NRestarts") or 0,
         )
 
 
@@ -417,8 +409,6 @@ class State:
     ble_failures: list[dict[str, Any]] = field(default_factory=list)
     resets: list[dict[str, Any]] = field(default_factory=list)
     plain_restarts: list[dict[str, Any]] = field(default_factory=list)
-    last_n_restarts: int = 0
-    counted_terminal: str = ""
     ready_instance: str = ""
     ready_since: dict[str, Any] | None = None
     stuck_counted: list[str] = field(default_factory=list)
@@ -449,9 +439,7 @@ def parse_state(raw: str) -> State:
     ready_since = data.get("ready_since")
     stuck = data.get("stuck_counted")
     if (
-        not _is_int(data.get("last_n_restarts"))
-        or not isinstance(data.get("counted_terminal"), str)
-        or not isinstance(data.get("ready_instance"), str)
+        not isinstance(data.get("ready_instance"), str)
         or not (ready_since is None or _is_stamp(ready_since))
         or not isinstance(stuck, list)
         or not all(
@@ -465,8 +453,6 @@ def parse_state(raw: str) -> State:
         return unreadable
     return State(
         **stamps,
-        last_n_restarts=data["last_n_restarts"],
-        counted_terminal=data["counted_terminal"][:64],
         ready_instance=data["ready_instance"][:32],
         ready_since=ready_since,
         stuck_counted=stuck[-MAX_SEEN_INSTANCES:],
@@ -543,35 +529,95 @@ def _recent(stamps: list[dict[str, Any]], clock: Clock, window: float) -> list:
     return [stamp for stamp in stamps if is_recent(stamp, clock, window)]
 
 
-def observe(
+# ---------------------------------------------------------------------------
+# Exit log, written by the root ExecStopPost=+ hook for every bridge exit
+# ---------------------------------------------------------------------------
+
+
+@contextlib.contextmanager
+def _exit_log_lock(settings: Settings) -> Iterator[None]:
+    """Hold the separate, brief exit-log lock (never the recovery lock)."""
+    settings.state_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with (settings.state_dir / "exits.lock").open("a") as handle:
+        fcntl.flock(handle, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(handle, fcntl.LOCK_UN)
+
+
+def _read_exit_log(path: Path) -> list[dict[str, Any]]:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return []
+    if not isinstance(data, list):
+        return []
+    return [
+        item
+        for item in data
+        if isinstance(item, dict)
+        and _is_stamp(item.get("stamp"))
+        and item.get("code") in EXIT_CODES
+        and isinstance(item.get("status"), str)
+        and EXIT_STATUS.fullmatch(item["status"])
+    ]
+
+
+def _write_exit_log(path: Path, entries: list[dict[str, Any]]) -> None:
+    temporary = path.with_name(".exits.json.tmp")
+    temporary.write_text(json.dumps(entries[-MAX_EXIT_LOG:]), encoding="utf-8")
+    temporary.chmod(0o600)
+    temporary.replace(path)
+
+
+def record_exit(settings: Settings, env: Mapping[str, str], clock: Clock) -> bool:
+    """
+    Append one bridge exit reported by systemd; return whether it was valid.
+
+    Runs as ``ExecStopPost=+`` of the bridge unit, i.e. as root, for every
+    stop including each automatic restart. ``EXIT_CODE``/``EXIT_STATUS`` are
+    set by systemd from the real process exit, not by the bridge. Kept
+    deliberately small and quick: it only appends under its own short lock.
+    """
+    code = env.get("EXIT_CODE", "")
+    status = env.get("EXIT_STATUS", "")
+    if code not in EXIT_CODES or EXIT_STATUS.fullmatch(status) is None:
+        return False
+    path = settings.state_dir / "exits.json"
+    with _exit_log_lock(settings):
+        entries = _read_exit_log(path)
+        entries.append({"stamp": clock.stamp(), "code": code, "status": status})
+        _write_exit_log(path, entries)
+    return True
+
+
+def consume_exits(settings: Settings) -> list[dict[str, Any]]:
+    path = settings.state_dir / "exits.json"
+    with _exit_log_lock(settings):
+        entries = _read_exit_log(path)
+        if entries:
+            _write_exit_log(path, [])
+    return entries
+
+
+def observe(  # noqa: PLR0913
     state: State,
     unit: UnitView,
     record: RecordView | None,
     clock: Clock,
     s: Settings,
+    exits: list[dict[str, Any]] | None = None,
 ) -> None:
-    """Fold one observation of systemd and the record into the state."""
+    """Fold one observation of systemd, its exit log and the record."""
+    for item in exits or []:
+        if item["code"] == "exited" and item["status"] == str(EXIT_BLE_STARTUP_FAILED):
+            state.ble_failures.append(item["stamp"])
     state.ble_failures = _recent(state.ble_failures, clock, s.failure_window)
     state.resets = _recent(state.resets, clock, s.long_window)
     state.plain_restarts = _recent(
         state.plain_restarts, clock, PLAIN_RESTART_WINDOW_SECONDS
     )
-
-    # Exits since the last run, from systemd's own counters. NRestarts only
-    # grows with automatic restarts and starts over after an explicit start.
-    previous = state.last_n_restarts if unit.n_restarts >= state.last_n_restarts else 0
-    new_exits = unit.n_restarts - previous
-    state.last_n_restarts = unit.n_restarts
-    if unit.active_state == "failed":
-        # The final exit before systemd gave up is not an automatic restart.
-        terminal = f"{unit.exec_main_pid}:{unit.n_restarts}"
-        if state.counted_terminal != terminal:
-            state.counted_terminal = terminal
-            new_exits += 1
-    if new_exits and unit.exec_main_status == EXIT_BLE_STARTUP_FAILED:
-        # Only the newest exit status is known; count at most what can matter.
-        for _ in range(min(new_exits, s.failures_to_reset)):
-            state.ble_failures.append(clock.stamp())
 
     record = trusted_record(record, unit)
     if record is None:
@@ -602,7 +648,9 @@ def observe(
         state.stuck_counted = [*state.stuck_counted, record.instance_id][
             -MAX_SEEN_INSTANCES:
         ]
-        state.ble_failures.append(clock.stamp())
+        # Stuck for 10 minutes means many missed retry cycles: that alone is
+        # a confirmed, repeated BLE fault, so it reaches the threshold.
+        state.ble_failures.extend(clock.stamp() for _ in range(s.failures_to_reset))
 
 
 def decide(  # noqa: PLR0911
@@ -865,7 +913,7 @@ def run_once(
             return "systemd_unavailable"
         state = load_state(settings)
         record = reader()
-        observe(state, unit, record, clock, settings)
+        observe(state, unit, record, clock, settings, consume_exits(settings))
         decision = decide(state, unit, record, clock, settings)
         if decision.action == ACTION_LATCH:
             state.recovery_failed = True
@@ -895,7 +943,9 @@ def run_once(
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__.splitlines()[1])
-    parser.add_argument("command", choices=("run", "status", "reset"), nargs="?")
+    parser.add_argument(
+        "command", choices=("run", "status", "reset", "record-exit"), nargs="?"
+    )
     args = parser.parse_args(argv)
     try:
         settings = Settings.from_env(os.environ)
@@ -903,6 +953,11 @@ def main(argv: list[str] | None = None) -> int:
         log(3, f"Invalid recovery settings: {error}")
         return 78
     command = args.command or "run"
+    if command == "record-exit":
+        # Never fail the bridge's stop: a bad value is just not recorded.
+        with contextlib.suppress(OSError):
+            record_exit(settings, os.environ, Clock())
+        return 0
     if command == "status":
         sys.stdout.write(load_state(settings).to_json() + "\n")
         return 0

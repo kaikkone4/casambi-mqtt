@@ -564,3 +564,44 @@ def test_cli_network_not_found_is_not_a_ble_exit(server, monkeypatch):
 
     monkeypatch.setattr(server, "main", not_found)
     assert server.cli([]) == server.EXIT_STARTUP_FAILED_OTHER == 79
+
+
+@pytest.mark.asyncio
+async def test_wedged_disconnect_after_connect_exits_75_not_76(server, monkeypatch):
+    monkeypatch.setattr(server, "BLE_CLEANUP_TIMEOUT", 0.01)
+    monkeypatch.setattr(server, "BLE_CANCEL_GRACE", 0.01)
+    exits = []
+
+    class Exited(BaseException):
+        pass
+
+    def hard_exit(code):
+        exits.append(code)
+        raise Exited
+
+    async def discover():
+        return [DEVICE]
+
+    release = asyncio.Event()
+
+    class WedgedDisconnectCasa(FakeCasa):
+        async def disconnect(self):
+            await stubborn(release)()
+
+    monkeypatch.setattr(server, "_hard_exit", hard_exit)
+    patch_bridge(server, monkeypatch, discover=discover, casa=WedgedDisconnectCasa())
+
+    async def ble_lost(*args, **kwargs):
+        raise server.CasambiDisconnected
+
+    monkeypatch.setattr(server, "run_connected_bridge", ble_lost)
+    try:
+        with pytest.raises(Exited):
+            await asyncio.wait_for(
+                server.main(sleep=Sleeps(), health=server.BridgeHealth()), timeout=5
+            )
+    finally:
+        release.set()
+        await asyncio.sleep(0)
+    # A lost link after a successful connect is never a startup failure.
+    assert exits == [server.EXIT_BLE_DISCONNECTED]
