@@ -255,14 +255,14 @@ def protocol_version_of(payload: str | bytes | bytearray) -> int | None:
     if value is None:
         return None
     version = value.get("protocol_version")
-    return version if _is_counter(version) else None
+    return version if type(version) is int and _is_counter(version) else None
 
 
 def _status_from_dict(value: object) -> BridgeStatus | None:
     if not isinstance(value, dict) or set(value) != STATUS_KEYS:
         return None
-    if value["protocol_version"] != PROTOCOL_VERSION or isinstance(
-        value["protocol_version"], bool
+    if type(value["protocol_version"]) is not int or (
+        value["protocol_version"] != PROTOCOL_VERSION
     ):
         return None
     snapshot = _parse_snapshot(value["snapshot"])
@@ -312,8 +312,8 @@ def parse_reply(  # noqa: PLR0911
     expected_keys = SNAPSHOT_REPLY_KEYS if reply_type == REPLY_SNAPSHOT else REPLY_KEYS
     if set(value) != expected_keys or reply_type not in REPLY_TYPES:
         return None
-    if value["protocol_version"] != PROTOCOL_VERSION or isinstance(
-        value["protocol_version"], bool
+    if type(value["protocol_version"]) is not int or (
+        value["protocol_version"] != PROTOCOL_VERSION
     ):
         return None
     status = _status_from_dict(value["status"])

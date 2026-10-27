@@ -622,3 +622,46 @@ def test_sigterm_is_a_clean_exit_in_any_phase(server, monkeypatch, swallowed_by_
     assert server.cli([]) == 0
     assert cleaned == ["cleanup"]
     assert signal.getsignal(signal.SIGTERM) is signal.SIG_DFL
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("failure", [aiomqtt.MqttError("timed out"), TimeoutError()])
+async def test_failed_reply_never_ends_the_session(server, failure, caplog):
+    class FailingReplyClient(BridgeMqttClient):
+        async def publish(self, topic, **kwargs):
+            if topic == REPLY_TOPIC:
+                raise failure
+            await super().publish(topic, **kwargs)
+
+    await server.process_command(
+        command({"action": "GET_STATUS", "request_id": "x1"}),
+        NoActuationCasa(),
+        FailingReplyClient(),
+        server.BridgeHealth(),
+    )
+    assert "Health reply publish failed" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_rate_limited_snapshot_reply_does_not_swallow_status_reply(server, hp):
+    clock = FakeClock()
+    health = server.BridgeHealth(monotonic=clock)
+    client = BridgeMqttClient()
+    casa = NoActuationCasa()
+    snapshot = {"action": "PUBLISH_ENTITIES", "request_id": "snap"}
+
+    await server.process_command(command(snapshot), casa, client, health)
+    clock.now += 5
+    await server.process_command(command(snapshot), casa, client, health)
+    await server.process_command(
+        command({"action": "GET_STATUS", "request_id": "status-1"}),
+        casa,
+        client,
+        health,
+    )
+
+    assert [(r.type, r.result) for r in replies(client, hp)] == [
+        (hp.REPLY_SNAPSHOT, hp.RESULT_OK),
+        (hp.REPLY_SNAPSHOT, hp.RESULT_RATE_LIMITED),
+        (hp.REPLY_STATUS, hp.RESULT_OK),
+    ]

@@ -289,7 +289,7 @@ class BridgeHealth:
         self.state_publish_failing: Callable[[], bool] = lambda: False
         self._snapshot = health_protocol.SnapshotSummary()
         self._snapshot_completed_at: float | None = None
-        self._last_reply_at: float | None = None
+        self._last_reply_at: dict[str, float] = {}
         self._last_snapshot_request_at: float | None = None
         self._status_failure_streak = 0
 
@@ -413,15 +413,18 @@ class BridgeHealth:
             diagnostics.health_status_published += 1
         return True
 
-    def reply_allowed(self) -> bool:
-        """Coalesce health requests: at most one reply per interval."""
+    def reply_allowed(self, kind: str = health_protocol.REPLY_STATUS) -> bool:
+        """
+        Coalesce health requests: at most one reply per interval and kind.
+
+        Status and snapshot replies have separate windows, so a rate-limited
+        snapshot answer can never swallow a status probe's reply.
+        """
         now = self._monotonic()
-        if (
-            self._last_reply_at is not None
-            and now - self._last_reply_at < HEALTH_REPLY_MIN_INTERVAL
-        ):
+        last = self._last_reply_at.get(kind)
+        if last is not None and now - last < HEALTH_REPLY_MIN_INTERVAL:
             return False
-        self._last_reply_at = now
+        self._last_reply_at[kind] = now
         return True
 
     def snapshot_request_allowed(self) -> bool:
@@ -464,15 +467,21 @@ class BridgeHealth:
                 failed=snapshot.failed,
                 generation=generation or 0,
             )
-        await asyncio.wait_for(
-            client.publish(
-                health_protocol.reply_topic(TOPIC_PREFIX, NETWORK_NAME),
-                payload=reply.to_json(),
-                qos=1,
-                retain=False,
-            ),
-            timeout=HEALTH_PUBLISH_TIMEOUT,
-        )
+        try:
+            await asyncio.wait_for(
+                client.publish(
+                    health_protocol.reply_topic(TOPIC_PREFIX, NETWORK_NAME),
+                    payload=reply.to_json(),
+                    qos=1,
+                    retain=False,
+                ),
+                timeout=HEALTH_PUBLISH_TIMEOUT,
+            )
+        except (aiomqtt.MqttError, TimeoutError):
+            # A failed reply only means the probe times out on the other
+            # side. It must never end the MQTT session: that would turn a
+            # non-actuating probe into a reconnect plus a full snapshot.
+            LOGGER.warning("Health reply publish failed")
 
 
 def sanitize_switch_event(event: Any) -> dict[str, int | str] | None:
@@ -1161,9 +1170,15 @@ async def _handle_snapshot_request(
     if not health.snapshot_request_allowed():
         if diagnostics is not None:
             diagnostics.health_requests_rate_limited += 1
-        if health.reply_allowed():
+        if health.reply_allowed(health_protocol.REPLY_SNAPSHOT):
+            # Answer with the snapshot reply type, so the requester can tell
+            # "busy" from "no answer"; zero counters claim nothing.
             await health.publish_reply(
-                client, request_id, health_protocol.RESULT_RATE_LIMITED
+                client,
+                request_id,
+                health_protocol.RESULT_RATE_LIMITED,
+                snapshot=SnapshotResult(units=0, scenes=0, failed=0),
+                generation=0,
             )
         return
     result = await publish_snapshot(casa, client)

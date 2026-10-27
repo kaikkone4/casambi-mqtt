@@ -107,8 +107,9 @@ The bridge publishes the same retained snapshot as the legacy command, and
 **only after every publish has been confirmed by the broker** (aiomqtt awaits
 the QoS 1 PUBACK) it replies with the confirmed counts. A partial failure
 replies `result=failed`; it is never acknowledged as success. Correlated
-snapshots are limited to one per 30 s; excess requests get
-`result=rate_limited`. The legacy `{"action":"PUBLISH_ENTITIES"}` without a
+snapshots are limited to one per 30 s; excess requests get a snapshot-type
+reply with `result=rate_limited` and zero counters. A reply that cannot be
+published is logged with a fixed line and never ends the MQTT session. The legacy `{"action":"PUBLISH_ENTITIES"}` without a
 `request_id` is unchanged and not rate limited.
 
 ### Reply
@@ -119,6 +120,8 @@ snapshots are limited to one per 30 s; excess requests get
 ```
 
 `type=snapshot` replies add `units`, `scenes`, `failed`, `generation`.
+`protocol_version` must be the JSON integer `1` (not `1.0` or `true`).
+Status and snapshot replies are coalesced in separate one-second windows.
 `result` is `ok`, `failed`, `rate_limited` or `busy`.
 
 ## What Home Assistant concludes
@@ -128,12 +131,16 @@ Home Assistant uses the **local monotonic receipt time** of each message.
 - A **retained** status is history (it is replayed on every subscribe and
   reconnect) and never makes the bridge healthy.
 - A status from an instance that has already been replaced, or a
-  non-increasing `sequence` of the current instance, is ignored.
+  non-increasing `sequence` of the current instance, is ignored. After an
+  instance's last will (`offline`), only a **new** instance can be live again.
 - `healthy` needs a live `ready` status received within the stale limit
   (default **120 s**). Within the startup grace (default **90 s**) without
   live status the bridge is `starting`, not failed.
-- No v1 status at all and no reply to `GET_STATUS` means an older bridge:
-  `unsupported`/`unknown`, never a fault to recover from.
+- Without one **live** v1 status since setup the bridge is `unknown`, even
+  if a retained one exists (it may be left over from a rolled-back bridge).
+  If `GET_STATUS` then goes unanswered it is `unsupported`: an older bridge,
+  or one that is down — the two cannot be told apart without a live message.
+  Neither is ever a fault to recover from.
 - A **status probe** succeeds only on a reply carrying the pending
   `request_id`, the live `instance_id`, before the deadline (default **20 s**).
   At most one probe is in flight; each kind runs at most every 5 minutes
@@ -142,8 +149,10 @@ Home Assistant uses the **local monotonic receipt time** of each message.
   to an `ok` reply, the entry's **real unit callback** has finished handling
   at least as many distinct unit topics as the bridge confirmed. An unchanged
   dimmer value counts. A separate raw listener counts what reached Home
-  Assistant: raw delivery without consumption is `consumer_stale`; missing raw
-  delivery is `delivery_incomplete`, which is not blamed on the consumer.
+  Assistant: full raw delivery with **nothing** handled is `consumer_stale`;
+  some handled but fewer than confirmed is `consumer_partial` (degraded);
+  missing raw delivery is `delivery_incomplete`, which is not blamed on the
+  consumer; a snapshot with zero units is `no_units` and proves nothing.
 
 ## What this does not prove
 

@@ -157,7 +157,40 @@ def test_retained_status_never_makes_the_bridge_healthy(retained_phase):
     obs.on_status(status(phase=retained_phase).to_json(), retain=True)
     assert obs.bridge_state() is BridgeState.STARTING
     clock.now += 91
+    # Retained history may be left over from a rolled-back v1 bridge.
+    assert obs.bridge_state() is BridgeState.UNKNOWN
+
+
+def test_rolled_back_bridge_with_leftover_retained_status_is_unsupported():
+    clock = FakeClock()
+    obs = observer(clock)
+    obs.on_status(status().to_json(), retain=True)
+    clock.now += 90
+    assert obs.tick().kind is ProbeKind.STATUS
+    clock.now += 21
+    obs.tick()
+    assert obs.bridge_state() is BridgeState.UNSUPPORTED
+
+
+def test_older_heartbeat_after_last_will_cannot_restore_healthy():
+    clock = FakeClock()
+    obs = observer(clock)
+    obs.on_status(status(sequence=50).to_json(), retain=False)
+    will = status(phase=hp.PHASE_OFFLINE, error=hp.ERROR_CONNECTION_LOST)
+    obs.on_status(json.dumps(will.as_dict() | {"sequence": None}), retain=False)
     assert obs.bridge_state() is BridgeState.UNAVAILABLE
+    for sequence in (3, 50, 51):
+        obs.on_status(status(sequence=sequence).to_json(), retain=False)
+        assert obs.bridge_state() is BridgeState.UNAVAILABLE
+    # Only a new process can be live again.
+    obs.on_status(status(INSTANCE_B, sequence=1).to_json(), retain=False)
+    assert obs.bridge_state() is BridgeState.HEALTHY
+
+
+@pytest.mark.parametrize("version", [1.0, True, "1"])
+def test_protocol_version_must_be_the_integer_one(version):
+    payload = json.dumps(status().as_dict() | {"protocol_version": version})
+    assert hp.parse_status(payload) is None
 
 
 def test_mqtt_reconnect_replaying_retained_status_does_not_refresh():
@@ -371,6 +404,30 @@ def test_frozen_consumer_is_stale_although_raw_and_status_work():
     assert ProbeKind.CONSUMER not in obs.last_ok
 
 
+def test_snapshot_without_units_never_proves_consumption():
+    clock = FakeClock()
+    obs = healthy_observer(clock)
+    probe = obs.start_probe(ProbeKind.CONSUMER)
+    obs.on_reply(reply(probe.request_id, reply_type=hp.REPLY_SNAPSHOT, units=0))
+    assert obs.last_result[ProbeKind.CONSUMER].outcome is ProbeOutcome.NO_UNITS
+    assert ProbeKind.CONSUMER not in obs.last_ok
+
+
+def test_partly_rejected_units_are_partial_not_stale():
+    clock = FakeClock()
+    obs = healthy_observer(clock)
+    probe = obs.start_probe(ProbeKind.CONSUMER)
+    for topic in ("a", "b", "c"):
+        obs.on_raw_unit(f"{EVENT_PREFIX}{topic}", "x")
+    obs.on_processed_unit(f"{EVENT_PREFIX}a")
+    obs.on_reply(reply(probe.request_id, reply_type=hp.REPLY_SNAPSHOT, units=3))
+    clock.now += 21
+    obs.tick()
+    assert (
+        obs.last_result[ProbeKind.CONSUMER].outcome is ProbeOutcome.CONSUMER_PARTIAL
+    )
+
+
 def test_missing_raw_delivery_is_not_blamed_on_the_consumer():
     clock = FakeClock()
     obs = healthy_observer(clock)
@@ -383,6 +440,21 @@ def test_missing_raw_delivery_is_not_blamed_on_the_consumer():
         obs.last_result[ProbeKind.CONSUMER].outcome
         is ProbeOutcome.DELIVERY_INCOMPLETE
     )
+
+
+def test_rate_limited_snapshot_is_busy_not_no_reply():
+    clock = FakeClock()
+    obs = healthy_observer(clock)
+    probe = obs.start_probe(ProbeKind.CONSUMER)
+    obs.on_reply(
+        reply(
+            probe.request_id,
+            reply_type=hp.REPLY_SNAPSHOT,
+            result=hp.RESULT_RATE_LIMITED,
+            units=0,
+        )
+    )
+    assert obs.last_result[ProbeKind.CONSUMER].outcome is ProbeOutcome.BRIDGE_BUSY
 
 
 def test_failed_snapshot_reply_is_not_success():
@@ -438,14 +510,29 @@ def test_settings_are_validated():
 # ---------------------------------------------------------------------------
 
 
-async def setup_entry(hass, clock):
+async def setup_entry(hass, clock, *, freeze_consumer=False):
     entry = MockConfigEntry(domain=DOMAIN, data={CONF_NETWORK_NAME: "test"}, version=2)
     entry.add_to_hass(hass)
     ids = iter(f"req-{index}" for index in range(1000))
-    with patch.object(
-        integration,
-        "HealthObserver",
-        partial(HealthObserver, monotonic=clock, token=lambda: next(ids)),
+    real_subscribe = integration.async_subscribe
+
+    async def subscribe(hass_arg, topic, callback, qos):
+        if freeze_consumer and getattr(callback, "__name__", "") == "event_processor":
+            # The entity consumer's subscription silently never fires, while
+            # every other subscription (raw listener included) still works.
+            async def frozen(_msg):
+                return None
+
+            callback = frozen
+        return await real_subscribe(hass_arg, topic, callback, qos)
+
+    with (
+        patch.object(
+            integration,
+            "HealthObserver",
+            partial(HealthObserver, monotonic=clock, token=lambda: next(ids)),
+        ),
+        patch.object(integration, "async_subscribe", side_effect=subscribe),
     ):
         assert await hass.config_entries.async_setup(entry.entry_id)
     await hass.async_block_till_done()
@@ -493,14 +580,18 @@ async def test_real_consumer_handles_unchanged_state_and_probe_succeeds(
 @pytest.mark.parametrize("expected_lingering_timers", [True])
 async def test_frozen_real_consumer_is_detected(hass, mqtt_mock):
     clock = FakeClock()
-    entry = await setup_entry(hass, clock)
+    entry = await setup_entry(hass, clock, freeze_consumer=True)
     obs = entry.runtime_data.health
     async_fire_mqtt_message(hass, "casambi/test/status", status().to_json())
     await hass.async_block_till_done()
+    status_probe = obs.start_probe(ProbeKind.STATUS)
+    async_fire_mqtt_message(
+        hass, "casambi/test/health/reply", reply(status_probe.request_id)
+    )
+    await hass.async_block_till_done()
+    assert obs.last_result[ProbeKind.STATUS].outcome is ProbeOutcome.OK
     probe = obs.start_probe(ProbeKind.CONSUMER)
 
-    # Freeze the entity consumer: its callback can no longer reach an entity.
-    entry.runtime_data.light_add_entities = None
     async_fire_mqtt_message(hass, f"{EVENT_PREFIX}addr", unit_payload("u1", "addr"))
     async_fire_mqtt_message(
         hass,
@@ -512,6 +603,9 @@ async def test_frozen_real_consumer_is_detected(hass, mqtt_mock):
     obs.tick()
 
     assert obs.last_result[ProbeKind.CONSUMER].outcome is ProbeOutcome.CONSUMER_STALE
+    assert obs.consumer.raw_messages == 1
+    assert obs.consumer.processed_messages == 0
+    assert hass.states.get("light.addressless_dimmer") is None
     assert obs.bridge_state() is BridgeState.HEALTHY
     assert await hass.config_entries.async_unload(entry.entry_id)
 
@@ -614,4 +708,7 @@ async def test_options_flow_validates_health_settings(hass, mqtt_mock):
     assert entry.options[CONF_STALE_SECONDS] == 300
     assert entry.options[CONF_PROBE_INTERVAL_SECONDS] == 300
     assert HealthSettings.from_options(entry.options).stale_seconds == 300
+    await hass.async_block_till_done()
+    # The options change reloaded only this entry with the new settings.
+    assert entry.runtime_data.health.settings.stale_seconds == 300
     assert await hass.config_entries.async_unload(entry.entry_id)

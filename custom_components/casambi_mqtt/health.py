@@ -104,7 +104,9 @@ class ProbeOutcome(StrEnum):
     BRIDGE_FAILED = "bridge_failed"
     BRIDGE_BUSY = "bridge_busy"
     DELIVERY_INCOMPLETE = "delivery_incomplete"
+    CONSUMER_PARTIAL = "consumer_partial"
     CONSUMER_STALE = "consumer_stale"
+    NO_UNITS = "no_units"
 
 
 class BridgeStatusTracker:
@@ -126,12 +128,16 @@ class BridgeStatusTracker:
         self.unsupported_version = False
         self.ignored = 0
         self._retired: list[str] = []
+        # Highest sequence seen from the current instance. The last will has
+        # no sequence and never lowers it, so a late or redelivered older
+        # heartbeat can never undo an ``offline``.
+        self._max_sequence: int | None = None
 
     @property
     def instance_id(self) -> str | None:
         return None if self.status is None else self.status.instance_id
 
-    def on_message(self, payload: str | bytes, *, retain: bool, now: float) -> bool:
+    def on_message(self, payload: str | bytes, *, retain: bool, now: float) -> bool:  # noqa: PLR0911
         """Record one status message; return whether it was accepted as live."""
         version = hp.protocol_version_of(payload)
         if version is not None and version != hp.PROTOCOL_VERSION:
@@ -149,16 +155,24 @@ class BridgeStatusTracker:
             return False
         current = self.status
         if current is not None and status.instance_id == current.instance_id:
+            if current.phase == hp.PHASE_OFFLINE and status.sequence is not None:
+                # After the last will, only a NEW instance can be live again.
+                self.ignored += 1
+                return False
             if (
                 status.sequence is not None
-                and current.sequence is not None
-                and status.sequence <= current.sequence
+                and self._max_sequence is not None
+                and status.sequence <= self._max_sequence
             ):
                 self.ignored += 1
                 return False
-        elif current is not None:
-            self._retired.append(current.instance_id)
-            del self._retired[:-RETIRED_INSTANCE_MEMORY]
+        else:
+            if current is not None:
+                self._retired.append(current.instance_id)
+                del self._retired[:-RETIRED_INSTANCE_MEMORY]
+            self._max_sequence = None
+        if status.sequence is not None:
+            self._max_sequence = status.sequence
         self.status = status
         self.received_at = now
         return True
@@ -170,9 +184,9 @@ class BridgeStatusTracker:
                 return BridgeState.STARTING
             if self.unsupported_version:
                 return BridgeState.UNSUPPORTED
-            if self.retained is not None:
-                # A v1 bridge existed, but nothing live has arrived since.
-                return BridgeState.UNAVAILABLE
+            # A retained status alone is history: it may be left over from a
+            # v1 bridge that has since been rolled back. Without one live v1
+            # message since setup this can only be "unknown".
             return BridgeState.UNKNOWN
         if self.status.phase == hp.PHASE_OFFLINE:
             return BridgeState.UNAVAILABLE
@@ -272,6 +286,9 @@ class ProbeTracker:
             return self._finish(ProbeOutcome.BRIDGE_FAILED, now)
         if pending.kind is ProbeKind.STATUS:
             return self._finish(ProbeOutcome.OK, now)
+        if not reply.units:
+            # Nothing was published, so nothing can prove consumption.
+            return self._finish(ProbeOutcome.NO_UNITS, now)
         return self.check(now)
 
     def record_raw(self, topic: str) -> None:
@@ -284,7 +301,7 @@ class ProbeTracker:
         self.pending.processed_topics.add(topic)
         return self.check(now)
 
-    def check(self, now: float) -> ProbeResult | None:
+    def check(self, now: float) -> ProbeResult | None:  # noqa: PLR0911
         """Finish the pending probe if it has succeeded or its deadline passed."""
         pending = self.pending
         if pending is None:
@@ -293,16 +310,23 @@ class ProbeTracker:
         if (
             pending.kind is ProbeKind.CONSUMER
             and reply is not None
-            and len(pending.processed_topics) >= (reply.units or 0)
+            and reply.units
+            and len(pending.processed_topics) >= reply.units
         ):
             return self._finish(ProbeOutcome.OK, now)
         if now <= pending.deadline_at:
             return None
         if reply is None:
             return self._finish(ProbeOutcome.NO_REPLY, now)
-        if len(pending.raw_topics) >= (reply.units or 0):
+        units = reply.units or 0
+        if len(pending.raw_topics) < units:
+            return self._finish(ProbeOutcome.DELIVERY_INCOMPLETE, now)
+        if not pending.processed_topics:
+            # Everything reached Home Assistant and nothing was handled.
             return self._finish(ProbeOutcome.CONSUMER_STALE, now)
-        return self._finish(ProbeOutcome.DELIVERY_INCOMPLETE, now)
+        # Some units were handled: the consumer runs, but a few payloads were
+        # rejected or failed. Degraded, never a reason to reload the entry.
+        return self._finish(ProbeOutcome.CONSUMER_PARTIAL, now)
 
     def cancel(self) -> None:
         self.pending = None
@@ -380,7 +404,6 @@ class HealthObserver:
             result is not None
             and result.outcome is ProbeOutcome.NO_REPLY
             and ProbeKind.STATUS not in self.last_ok
-            and self.bridge.retained is None
         )
 
     def on_status(self, payload: str | bytes, *, retain: bool) -> None:

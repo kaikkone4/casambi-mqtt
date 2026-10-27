@@ -381,9 +381,16 @@ async def async_setup_entry(  # noqa: PLR0915
         raise
     for unsubscribe in unsubscribers:
         entry.async_on_unload(unsubscribe)
+    # Changed options (network name, health settings) take effect by reloading
+    # only this entry.
+    entry.async_on_unload(entry.add_update_listener(_async_options_updated))
 
     LOGGER.debug("Casambi MQTT subscriptions set up for %s", network_name)
     return True
+
+
+async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    await hass.config_entries.async_reload(entry.entry_id)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
