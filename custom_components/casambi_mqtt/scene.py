@@ -40,8 +40,8 @@ class CasambiMqttScene(HAScene):
 
     def update_entity(self, scene: Scene) -> None:
         self._attr_name = scene.name
-        # A user-disabled entity is never added to Home Assistant (no hass,
-        # no entity_id); writing its state would raise on every update.
+        # A user-disabled entity is never added to Home Assistant: its hass is
+        # cleared again, and writing its state would raise on every update.
         if self.hass is not None and self.entity_id is not None:
             self.async_write_ha_state()
 

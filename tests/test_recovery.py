@@ -565,6 +565,8 @@ async def test_recovery_disabled_by_option_never_reloads(hass, mqtt_bridge):
             await h.consumer_probe()
             await h.tick(100)
         assert h.reloads == 0
+        # Detection and the sensor keep working with recovery disabled.
+        assert h.coordinator.state is ConsumerState.CONSUMER_STALE
         await hass.config_entries.async_unload(h.entry.entry_id)
 
 
@@ -646,4 +648,154 @@ async def test_disabled_light_updates_are_handled_without_errors(
         assert "NoEntitySpecifiedError" not in caplog.text
         assert "Task exception was never retrieved" not in caplog.text
         assert h.runtime.health.consumer.processed_messages == 3
+        await hass.config_entries.async_unload(h.entry.entry_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expected_lingering_timers", [True])
+async def test_disabled_light_is_not_a_verification_target(hass, mqtt_bridge):
+    from homeassistant.helpers import entity_registry as er
+
+    with ExitStack() as stack:
+        entry = MockConfigEntry(
+            domain=DOMAIN, data={CONF_NETWORK_NAME: "test"}, version=2
+        )
+        entry.add_to_hass(hass)
+        er.async_get(hass).async_get_or_create(
+            "light",
+            DOMAIN,
+            f"{entry.entry_id}_casambi_mqtt_light_test-1",
+            config_entry=entry,
+            disabled_by=er.RegistryEntryDisabler.USER,
+        )
+        h = await mqtt_bridge(stack=stack, entry=entry)
+        await healthy_start(h)
+        assert h.manager.request_recovery(h.coordinator.settings) == "started"
+        await h.wait_recovery()
+        assert h.manager.last_result == "recovered"
+        await hass.config_entries.async_unload(h.entry.entry_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expected_lingering_timers", [True])
+async def test_lost_delivery_is_never_reported_healthy(hass, mqtt_bridge):
+    with ExitStack() as stack:
+        h = await mqtt_bridge(stack=stack)
+        await healthy_start(h)
+        # The bridge confirms two units but none reach Home Assistant.
+        h.bridge._respond = lambda command: (
+            command.get("action") == hp.PUBLISH_ENTITIES_ACTION
+            and async_fire_mqtt_message(
+                hass,
+                "casambi/test/health/reply",
+                hp.HealthReply(
+                    hp.REPLY_SNAPSHOT,
+                    command["request_id"],
+                    INSTANCE,
+                    hp.RESULT_OK,
+                    h.bridge._status(),
+                    units=2,
+                    scenes=0,
+                    failed=0,
+                    generation=1,
+                ).to_json(),
+            )
+        )
+        result = await h.consumer_probe()
+        assert result.outcome.value == "delivery_incomplete"
+        assert h.coordinator.state is ConsumerState.BRIDGE_UNAVAILABLE
+        assert h.reloads == 0
+        await hass.config_entries.async_unload(h.entry.entry_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expected_lingering_timers", [True])
+async def test_a_failed_verification_needs_two_new_proofs(hass, mqtt_bridge):
+    with ExitStack() as stack:
+        h = await mqtt_bridge(stack=stack)
+        await healthy_start(h)
+        h.frozen_generations.update(range(1, 20))
+        await h.consumer_probe()
+        await h.tick(90)
+        await h.tick(21)
+        await h.wait_recovery()
+        assert h.reloads == 1
+        assert h.manager.last_result == "verify_failed"
+        assert h.manager.stale_streak == 0
+
+        h.clock.advance(700)  # past the cooldown
+        first = await h.consumer_probe()
+        assert first.outcome.value == "consumer_stale"
+        await h.settle()
+        assert h.reloads == 1  # one new proof is not enough
+        await hass.config_entries.async_unload(h.entry.entry_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expected_lingering_timers", [True])
+async def test_callback_timer_and_reconnect_together_give_one_reload(
+    hass, mqtt_bridge
+):
+    from custom_components.casambi_mqtt.health import ProbeOutcome, ProbeResult
+
+    with ExitStack() as stack:
+        h = await mqtt_bridge(stack=stack)
+        await healthy_start(h)
+        stale = ProbeResult(
+            kind=ProbeKind.CONSUMER,
+            outcome=ProbeOutcome.CONSUMER_STALE,
+            finished_at=h.clock.mono,
+        )
+        h.coordinator._on_probe_result(stale)  # first proof
+        h.clock.advance(100)
+        # The callback path, the deadline timer and a reconnect all report
+        # the second proof in the same loop iteration.
+        for listener in list(h.runtime.health.listeners) * 3:
+            listener(stale)
+        h.manager.request_recovery(h.coordinator.settings)
+        await h.wait_recovery()
+        assert h.reloads == 1
+        await hass.config_entries.async_unload(h.entry.entry_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expected_lingering_timers", [True])
+async def test_unsupported_warning_is_removed_after_bridge_upgrade_and_reload(
+    hass, mqtt_bridge
+):
+    with ExitStack() as stack:
+        h = await mqtt_bridge(stack=stack)
+        real_heartbeat = h.bridge.heartbeat
+        h.bridge.answer = False
+        h.bridge.heartbeat = lambda: None
+        await h.tick(91)
+        await h.tick(25)
+        registry = ir.async_get(hass)
+        issue = unsupported_issue_id(h.entry.entry_id)
+        assert registry.async_get_issue(DOMAIN, issue) is not None
+
+        h.bridge.answer = True
+        h.bridge.heartbeat = real_heartbeat
+        assert await hass.config_entries.async_reload(h.entry.entry_id)
+        await h.settle()
+        await h.tick(1)
+        assert registry.async_get_issue(DOMAIN, issue) is None
+        await hass.config_entries.async_unload(h.entry.entry_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expected_lingering_timers", [True])
+async def test_latch_and_its_repair_issue_survive_a_restart(hass, mqtt_bridge):
+    with ExitStack() as stack:
+        h = await mqtt_bridge(stack=stack)
+        await h.manager._async_latch("budget_exhausted")
+        registry = ir.async_get(hass)
+        issue = recovery_issue_id(h.entry.entry_id)
+        # A restart loses non-persistent issues ...
+        ir.async_delete_issue(hass, DOMAIN, issue)
+        restarted = RecoveryManager(hass, h.entry.entry_id)
+        await restarted.async_load()
+        # ... and loading the stored latch brings back the way to clear it.
+        assert restarted.failed
+        assert registry.async_get_issue(DOMAIN, issue) is not None
         await hass.config_entries.async_unload(h.entry.entry_id)

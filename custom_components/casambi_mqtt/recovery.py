@@ -58,6 +58,7 @@ class ConsumerState(StrEnum):
     RECOVERING = "recovering"
     RECOVERY_FAILED = "recovery_failed"
     UNSUPPORTED = "unsupported"
+    DEGRADED = "degraded"
 
 
 def recovery_issue_id(entry_id: str) -> str:
@@ -117,6 +118,10 @@ class RecoveryManager:
                 setattr(self, key, data[key][:64])
         if isinstance(data.get("last_recovery"), str):
             self.last_recovery = data["last_recovery"][:40]
+        if self.failed:
+            # Repair issues are not persistent: restore the acknowledgement
+            # path together with the latch after a Home Assistant restart.
+            self._create_failed_issue()
 
     async def _async_save(self) -> None:
         await self._store.async_save(
@@ -144,17 +149,25 @@ class RecoveryManager:
 
     # -- stale streak --------------------------------------------------------
 
-    def record_stale(self, confirm_seconds: float) -> bool:
-        """Count a stale proof; return True once two are far enough apart."""
+    def record_stale(self, confirm_seconds: float, max_gap: float) -> bool:
+        """
+        Count a stale proof; return True once two consecutive ones agree.
+
+        The second proof must come at least ``confirm_seconds`` and at most
+        ``max_gap`` after the first; an older first proof starts over.
+        """
         now = self._monotonic()
-        if self.last_stale_at is None or self.stale_streak == 0:
+        if (
+            self.last_stale_at is None
+            or self.stale_streak == 0
+            or now - self.last_stale_at > max_gap
+        ):
             self.stale_streak = 1
             self.last_stale_at = now
             return False
         if now - self.last_stale_at < confirm_seconds:
             return False
-        self.stale_streak += 1
-        self.last_stale_at = now
+        self.clear_streak()
         return True
 
     def clear_streak(self) -> None:
@@ -198,6 +211,11 @@ class RecoveryManager:
         self.last_result = "recovery_failed"
         await self._async_save()
         LOGGER.error("Casambi MQTT consumer recovery stopped: %s", reason)
+        self._create_failed_issue()
+        self._notify()
+
+    @callback
+    def _create_failed_issue(self) -> None:
         ir.async_create_issue(
             self.hass,
             DOMAIN,
@@ -208,7 +226,6 @@ class RecoveryManager:
             translation_key="recovery_failed",
             data={"entry_id": self.entry_id},
         )
-        self._notify()
 
     async def _async_recover(self, settings: HealthSettings) -> None:
         async with self.lock:
@@ -216,6 +233,9 @@ class RecoveryManager:
                 # Charge the budget before acting: a crash halfway through can
                 # never hand out a free extra reload.
                 self.reloads = [*self.recent_reloads(), self._wall()]
+                # The proofs that led here are used up: the reloaded entry
+                # must prove a fault twice again before another reload.
+                self.clear_streak()
                 await self._async_save()
                 targets = self._current_targets()
                 LOGGER.warning("Casambi MQTT consumer is stale; reloading this entry")
@@ -247,10 +267,13 @@ class RecoveryManager:
         entry = self._entry()
         runtime = getattr(entry, "runtime_data", None)
         lights = getattr(runtime, "lights", {}) or {}
+        # A user-disabled light is never added (hass stays None) and never
+        # has a state, so it can be neither a target nor a blocker.
         return sorted(
             light.entity_id
             for light in lights.values()
             if getattr(light, "entity_id", None)
+            and getattr(light, "hass", None) is not None
         )
 
     async def _async_verify(self, targets: list[str], settings: HealthSettings) -> bool:
@@ -261,7 +284,12 @@ class RecoveryManager:
         reloaded entry, and every previously present light entity must exist
         again with a state other than ``unavailable``.
         """
-        deadline = self._monotonic() + settings.recovery_verify_seconds
+        # Never shorter than the reloaded entry's own startup grace plus one
+        # probe, or every reload could fail verification by construction.
+        deadline = self._monotonic() + max(
+            settings.recovery_verify_seconds,
+            settings.startup_grace_seconds + settings.probe_deadline_seconds + 60,
+        )
         last_probe_at: float | None = None
         while self._monotonic() < deadline:
             entry = self._entry()
@@ -398,7 +426,10 @@ class HealthCoordinator:
         self.last_consumer_ok: str | None = None
         self.state = ConsumerState.STARTING
         self.reason = "startup"
-        self._unsupported_issue = False
+        # None: the first update always syncs the issue, so a reload after a
+        # bridge upgrade removes a warning left by the previous setup.
+        self._unsupported_issue: bool | None = None
+        self.last_consumer: ProbeResult | None = None
         observer.listeners.append(self._on_probe_result)
         manager.listeners.append(self.async_update)
 
@@ -430,12 +461,21 @@ class HealthCoordinator:
                 if status is None or status.error == "none"
                 else status.error
             )
-        if self.manager.stale_streak:
-            return ConsumerState.CONSUMER_STALE, "consumer_not_processing"
-        result = self.observer.last_result.get(ProbeKind.CONSUMER)
+        result = self.last_consumer
         if result is None:
             return ConsumerState.STARTING, "waiting_for_consumer_probe"
-        return ConsumerState.HEALTHY, result.outcome.value
+        outcome = result.outcome
+        if outcome is ProbeOutcome.OK:
+            return ConsumerState.HEALTHY, outcome.value
+        if outcome is ProbeOutcome.CONSUMER_STALE:
+            return ConsumerState.CONSUMER_STALE, outcome.value
+        if outcome in {
+            ProbeOutcome.NO_REPLY,
+            ProbeOutcome.BRIDGE_FAILED,
+            ProbeOutcome.DELIVERY_INCOMPLETE,
+        }:
+            return ConsumerState.BRIDGE_UNAVAILABLE, outcome.value
+        return ConsumerState.DEGRADED, outcome.value
 
     @callback
     def async_update(self) -> None:
@@ -450,7 +490,7 @@ class HealthCoordinator:
     @callback
     def _update_unsupported_issue(self, state: ConsumerState) -> None:
         unsupported = state is ConsumerState.UNSUPPORTED
-        if unsupported == self._unsupported_issue:
+        if unsupported is self._unsupported_issue:
             return
         self._unsupported_issue = unsupported
         if unsupported:
@@ -471,15 +511,18 @@ class HealthCoordinator:
     @callback
     def _on_probe_result(self, result: ProbeResult) -> None:
         if result.kind is ProbeKind.CONSUMER:
+            if result.outcome is not ProbeOutcome.BRIDGE_BUSY:
+                # "busy" says nothing about the consumer: keep the last verdict.
+                self.last_consumer = result
             if result.outcome is ProbeOutcome.OK:
                 self.last_consumer_ok = dt_util.utcnow().isoformat(timespec="seconds")
                 if self.manager.stale_streak or self.manager.failed:
                     self.hass.async_create_task(self.manager.async_mark_healthy())
             elif result.outcome is ProbeOutcome.CONSUMER_STALE:
                 self._on_consumer_stale()
-            else:
+            elif result.outcome is not ProbeOutcome.BRIDGE_BUSY:
                 # Anything else is not a correlated proof of a stuck consumer
-                # (busy bridge, missing delivery, partial handling): it never
+                # (missing delivery, partial handling, no units): it never
                 # counts towards a reload and breaks a stale streak.
                 self.manager.clear_streak()
         self.async_update()
@@ -492,7 +535,13 @@ class HealthCoordinator:
             # Only a working broker/bridge path can blame the consumer.
             self.manager.clear_streak()
             return
-        if self.manager.record_stale(self.settings.stale_confirm_seconds):
+        confirm = self.settings.stale_confirm_seconds
+        max_gap = (
+            3 * confirm
+            + self.settings.probe_deadline_seconds
+            + self.settings.consumer_probe_interval_seconds
+        )
+        if self.manager.record_stale(confirm, max_gap):
             self.manager.request_recovery(self.settings)
             return
         # First proof: re-check with a fresh non-actuating sync, no sooner

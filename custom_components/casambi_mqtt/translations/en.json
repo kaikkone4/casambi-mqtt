@@ -60,7 +60,8 @@
           "consumer_stale": "Updates stuck",
           "recovering": "Recovering",
           "recovery_failed": "Recovery failed",
-          "unsupported": "Bridge too old"
+          "unsupported": "Bridge too old",
+          "degraded": "Degraded"
         }
       }
     }

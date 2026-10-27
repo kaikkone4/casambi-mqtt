@@ -60,7 +60,8 @@
           "consumer_stale": "Päivitykset jumissa",
           "recovering": "Palautetaan",
           "recovery_failed": "Palautus epäonnistui",
-          "unsupported": "Silta liian vanha"
+          "unsupported": "Silta liian vanha",
+          "degraded": "Heikentynyt"
         }
       }
     }

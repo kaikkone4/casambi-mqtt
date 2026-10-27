@@ -167,9 +167,10 @@ Each Casambi MQTT config entry watches its own processing of unit messages (see 
 | State | Meaning | Automatic action |
 |---|---|---|
 | `starting` | startup grace (90 s), entity platforms not ready yet, or no live bridge status yet | none |
-| `healthy` | the last correlated snapshot probe was handled by this entry's real light callback | none |
-| `bridge_unavailable` | no fresh bridge status, `offline`, or the bridge reports `degraded` (e.g. BLE lost); the reason is in the `reason` attribute | none: an external outage is never "fixed" by reloading |
-| `consumer_stale` | the bridge confirmed a snapshot and the messages reached Home Assistant, but this entry handled **none** of them | after a second proof at least 90 s later: reload this entry |
+| `healthy` | the last correlated snapshot probe succeeded: this entry's real light callback handled every confirmed unit | none |
+| `degraded` | the last probe was handled only partly (some payloads rejected) or the bridge had no units | none |
+| `bridge_unavailable` | no fresh bridge status, `offline`, the bridge reports `degraded` (e.g. BLE lost), or the last probe got no reply or lost unit messages on the way; the reason is in the `reason` attribute | none: an external outage is never "fixed" by reloading |
+| `consumer_stale` | the bridge confirmed a snapshot and the messages reached Home Assistant, but this entry handled **none** of them | after a second consecutive proof 90 s or more later: reload this entry (unless disabled) |
 | `recovering` | a reload of this entry is running and being verified | — |
 | `recovery_failed` | the reload budget is spent or a reload could not be verified | none until acknowledged |
 | `unsupported` | the bridge does not answer the health protocol (older bridge) | none; a repair notice explains the update |
@@ -179,7 +180,7 @@ How recovery works:
 - Only `hass.config_entries.async_reload(<this entry>)` is used. It never restarts Home Assistant, never touches another entry or the bridge host, and never sends a light or scene command.
 - At most one reload runs at a time. Reloads are at least 10 minutes apart and limited to two per 30 minutes.
 - The budget and the latch are kept outside the entry, in a per-entry store, so the entry's own reload or a Home Assistant restart does not reset them.
-- A reload counts as successful only if the entry is loaded again, a **new** consumer probe succeeds, and every previously present light entity is available again. A fresh `unavailable` state does not count.
+- A reload counts as successful only if the entry is loaded again, a **new** consumer probe succeeds, and every previously present light entity is available again. A fresh `unavailable` state does not count. User-disabled lights are not required. Verification always waits at least the startup grace plus one probe. After a failed verification the entry must prove the fault twice again before the next reload.
 - When the limit is reached, one repair issue is raised (updated, never repeated). Its fix flow re-enables automatic recovery after you have looked at the problem.
 - A later healthy probe clears it and shows a "recovered" notification.
 
