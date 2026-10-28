@@ -799,3 +799,26 @@ async def test_latch_and_its_repair_issue_survive_a_restart(hass, mqtt_bridge):
         assert restarted.failed
         assert registry.async_get_issue(DOMAIN, issue) is not None
         await hass.config_entries.async_unload(h.entry.entry_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expected_lingering_timers", [True])
+async def test_superseded_probe_keeps_the_verdict_and_breaks_the_streak(
+    hass, mqtt_bridge
+):
+    from custom_components.casambi_mqtt.health import ProbeOutcome, ProbeResult
+
+    with ExitStack() as stack:
+        h = await mqtt_bridge(stack=stack)
+        await healthy_start(h)
+        h.coordinator._on_probe_result(
+            ProbeResult(ProbeKind.CONSUMER, ProbeOutcome.CONSUMER_STALE, h.clock.mono)
+        )
+        assert h.manager.stale_streak == 1
+        h.coordinator._on_probe_result(
+            ProbeResult(ProbeKind.CONSUMER, ProbeOutcome.SUPERSEDED, h.clock.mono)
+        )
+        assert h.manager.stale_streak == 0
+        assert h.coordinator.state is ConsumerState.CONSUMER_STALE
+        assert h.reloads == 0
+        await hass.config_entries.async_unload(h.entry.entry_id)

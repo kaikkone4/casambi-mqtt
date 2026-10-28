@@ -511,8 +511,12 @@ class HealthCoordinator:
     @callback
     def _on_probe_result(self, result: ProbeResult) -> None:
         if result.kind is ProbeKind.CONSUMER:
-            if result.outcome is not ProbeOutcome.BRIDGE_BUSY:
-                # "busy" says nothing about the consumer: keep the last verdict.
+            if result.outcome not in {
+                ProbeOutcome.BRIDGE_BUSY,
+                ProbeOutcome.SUPERSEDED,
+            }:
+                # "busy" and "superseded" say nothing about the consumer:
+                # keep the last verdict.
                 self.last_consumer = result
             if result.outcome is ProbeOutcome.OK:
                 self.last_consumer_ok = dt_util.utcnow().isoformat(timespec="seconds")
@@ -522,8 +526,9 @@ class HealthCoordinator:
                 self._on_consumer_stale()
             elif result.outcome is not ProbeOutcome.BRIDGE_BUSY:
                 # Anything else is not a correlated proof of a stuck consumer
-                # (missing delivery, partial handling, no units): it never
-                # counts towards a reload and breaks a stale streak.
+                # (missing delivery, partial handling, no units, or a new
+                # bridge process): it never counts towards a reload and
+                # breaks a stale streak.
                 self.manager.clear_streak()
         self.async_update()
 
