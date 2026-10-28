@@ -148,14 +148,25 @@ Home Assistant uses the **local monotonic receipt time** of each message.
   `request_id`, the live `instance_id`, before the deadline (default **20 s**).
   At most one probe is in flight; each kind runs at most every 5 minutes
   (status default 5 min, consumer default 15 min).
-- A **consumer probe** (correlated snapshot) succeeds only when, in addition
-  to an `ok` reply, the entry's **real unit callback** has finished handling
-  at least as many distinct unit topics as the bridge confirmed. An unchanged
-  dimmer value counts. A separate raw listener counts what reached Home
-  Assistant: full raw delivery with **nothing** handled is `consumer_stale`;
-  some handled but fewer than confirmed is `consumer_partial` (degraded);
-  missing raw delivery is `delivery_incomplete`, which is not blamed on the
-  consumer; a snapshot with zero units is `no_units` and proves nothing.
+- A **consumer probe** (correlated snapshot) succeeds only if, **by the
+  deadline**, in addition to an `ok` reply:
+  - at least as many distinct unit topics reached Home Assistant during the
+    probe as the bridge confirmed publishing, and
+  - the entry's **real unit callback** handled **every** unit message that
+    the separate raw listener saw during the probe, counted per topic.
+  Handling of unrelated ambient updates therefore cannot certify a snapshot
+  whose own messages were not handled. An unchanged dimmer value counts as
+  handled. Nothing after the deadline counts. Outcomes:
+  - full raw delivery with **nothing** handled: `consumer_stale`;
+  - some handled but not all: `consumer_partial` (degraded);
+  - missing raw delivery: `delivery_incomplete`, not blamed on the consumer;
+  - a snapshot with zero units: `no_units`, which proves nothing;
+  - a bridge instance change while the probe is pending: `superseded`, which
+    is inconclusive. Evidence from one bridge process never certifies another.
+
+What remains uncorrelated: unit payloads carry no snapshot identifier
+(changing them would break older consumers), so the per-topic coverage
+above, bounded by the probe window, is the binding.
 
 ## What this does not prove
 
