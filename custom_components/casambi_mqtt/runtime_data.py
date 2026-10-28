@@ -2,13 +2,16 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from time import monotonic
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from homeassistant.helpers.entity_platform import AddEntitiesCallback
     from homeassistant.helpers.storage import Store
 
+    from .health import HealthObserver
+    from .health_monitor import HealthMonitor
     from .light import CasambiMqttLight
+    from .recovery import HealthCoordinator
     from .scene import CasambiMqttScene
 
 SWITCH_EVENT_DEDUP_SECONDS = 0.25
@@ -19,6 +22,7 @@ class CasambiMqttRuntimeData:
     """Runtime state isolated to one config entry."""
 
     network_name: str
+    applied_options: dict[str, Any] = field(default_factory=dict)
     light_add_entities: AddEntitiesCallback | None = None
     scene_add_entities: AddEntitiesCallback | None = None
     event_add_entities: AddEntitiesCallback | None = None
@@ -28,6 +32,9 @@ class CasambiMqttRuntimeData:
     switch_button_events: set[tuple[int, int]] = field(default_factory=set)
     last_switch_events: dict[tuple[int, int, str], float] = field(default_factory=dict)
     switch_store: Store | None = None
+    health: HealthObserver | None = None
+    health_coordinator: HealthCoordinator | None = None
+    health_monitor: HealthMonitor | None = None
 
     def is_duplicate_switch_event(self, event_key: tuple[int, int, str]) -> bool:
         """Collapse an identical QoS retry burst, but not distinct event phases."""

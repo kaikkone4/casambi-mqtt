@@ -26,7 +26,7 @@ jobs:
           run: python3 -m pip install -r requirements-server.txt -r requirements-dev.txt
 
         - name: "Run bridge unit tests"
-          run: pytest -q tests/test_server.py tests/test_switch_decoder.py tests/test_bridge_lifecycle.py
+          run: pytest -q tests/test_server.py tests/test_switch_decoder.py tests/test_bridge_lifecycle.py tests/test_bridge_health.py
 
         - name: "Syntax check"
           run: python3 -m py_compile server.py
@@ -54,4 +54,4 @@ jobs:
         - name: "Run Home Assistant component tests"
           run: |
             python3 -m pip install -r requirements-test.txt
-            pytest -q tests/test_light.py tests/test_integration.py tests/test_migration.py tests/test_switch_events.py tests/test_device_trigger_discovery.py tests/test_target_trigger_discovery.py -o asyncio_mode=auto
+            pytest -q tests/test_light.py tests/test_integration.py tests/test_migration.py tests/test_switch_events.py tests/test_device_trigger_discovery.py tests/test_target_trigger_discovery.py tests/test_health.py tests/test_recovery.py -o asyncio_mode=auto

@@ -53,7 +53,10 @@ class CasambiMqttLight(LightEntity):
         self._unit_uuid = unit.uuid
         self._attr_is_on = dimmer > 0
         self._attr_brightness = dimmer
-        self.async_write_ha_state()
+        # A user-disabled entity is never added to Home Assistant: its hass is
+        # cleared again, and writing its state would raise on every update.
+        if self.hass is not None and self.entity_id is not None:
+            self.async_write_ha_state()
 
     async def async_turn_on(self, **kwargs: Any) -> None:
         if ATTR_BRIGHTNESS in kwargs:

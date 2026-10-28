@@ -18,6 +18,7 @@ from .const import (
     configured_network_name,
     is_valid_network_name,
 )
+from .health import CONF_RECOVERY_ENABLED, SETTING_RANGES, HealthSettings
 
 
 def configured_network_names(
@@ -99,18 +100,31 @@ class CasambiMqttOptionsFlow(config_entries.OptionsFlow):
                 self.hass.config_entries.async_update_entry(
                     self.entry, unique_id=network_name
                 )
-                return self.async_create_entry(
-                    title=network_name,
-                    data={CONF_NETWORK_NAME: network_name},
+                data = {CONF_NETWORK_NAME: network_name}
+                data.update(
+                    {
+                        key: user_input[key]
+                        for key in (*SETTING_RANGES, CONF_RECOVERY_ENABLED)
+                        if key in user_input
+                    }
                 )
+                return self.async_create_entry(title=network_name, data=data)
 
         current_name: str = configured_network_name(self.entry.options, self.entry.data)
+        current_health = HealthSettings.from_options(self.entry.options)
 
-        data_schema = vol.Schema(
-            {
-                vol.Required(CONF_NETWORK_NAME, default=current_name): str,
-            }
-        )
+        schema: dict[Any, Any] = {
+            vol.Required(CONF_NETWORK_NAME, default=current_name): str,
+        }
+        for key, (_default, minimum, maximum) in SETTING_RANGES.items():
+            current = getattr(current_health, key.removeprefix("health_"))
+            schema[vol.Required(key, default=current)] = vol.All(
+                vol.Coerce(int), vol.Range(min=minimum, max=maximum)
+            )
+        schema[
+            vol.Required(CONF_RECOVERY_ENABLED, default=current_health.recovery_enabled)
+        ] = bool
+        data_schema = vol.Schema(schema)
 
         return self.async_show_form(
             step_id="init",

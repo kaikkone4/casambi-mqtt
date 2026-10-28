@@ -17,7 +17,16 @@
       "init": {
         "description": "{restart_note}",
         "data": {
-          "mqtt_network_name": "MQTT-verkon nimi"
+          "mqtt_network_name": "MQTT-verkon nimi",
+          "health_stale_seconds": "Sillan tila vanhenee (sekuntia)",
+          "health_startup_grace_seconds": "Käynnistyksen armonaika ennen terveysarviota (sekuntia)",
+          "health_probe_interval_seconds": "Sillan tilakyselyn väli (sekuntia, vähintään 300)",
+          "health_consumer_probe_interval_seconds": "Kulutuskokeen snapshot-väli (sekuntia, vähintään 300)",
+          "health_probe_deadline_seconds": "Kokeen vastauksen määräaika (sekuntia)",
+          "health_recovery_cooldown_seconds": "Automaattisten uudelleenlatausten vähimmäisväli (sekuntia, vähintään 600)",
+          "health_stale_confirm_seconds": "Kahden jumi-havainnon väli ennen uudelleenlatausta (sekuntia, vähintään 90)",
+          "health_recovery_verify_seconds": "Uudelleenlatauksen varmistuksen aikaraja (sekuntia)",
+          "health_recovery_enabled": "Lataa tämä integraatio automaattisesti uudelleen, jos päivitykset jumittuvat"
         }
       }
     },
@@ -41,6 +50,20 @@
           }
         }
       }
+    },
+    "sensor": {
+      "health": {
+        "state": {
+          "starting": "Käynnistyy",
+          "healthy": "Kunnossa",
+          "bridge_unavailable": "Silta ei tavoitettavissa",
+          "consumer_stale": "Päivitykset jumissa",
+          "recovering": "Palautetaan",
+          "recovery_failed": "Palautus epäonnistui",
+          "unsupported": "Silta liian vanha",
+          "degraded": "Heikentynyt"
+        }
+      }
     }
   },
   "device_automation": {
@@ -49,6 +72,23 @@
       "release": "Painike {subtype} vapautettiin",
       "hold": "Painiketta {subtype} pidettiin painettuna",
       "release_after_hold": "Painike {subtype} vapautettiin pitkän painalluksen jälkeen"
+    }
+  },
+  "issues": {
+    "recovery_failed": {
+      "title": "Casambi MQTT:n automaattinen palautus pysäytetty",
+      "fix_flow": {
+        "step": {
+          "confirm": {
+            "title": "Ota automaattinen palautus uudelleen käyttöön",
+            "description": "Home Assistant vastaanotti Casambin tilaviestejä, mutta tämä Casambi MQTT -integraatio ei käsitellyt niitä, eivätkä automaattiset uudelleenlataukset korjanneet tilannetta. Uusia automaattisia uudelleenlatauksia ei tehdä. Syy näkyy integraation Casambi health -sensorissa. Tarkista Home Assistantin loki ja lähetä, niin tämän integraation automaattinen palautus sallitaan taas normaalien rajojen puitteissa."
+          }
+        }
+      }
+    },
+    "bridge_unsupported": {
+      "title": "Casambi MQTT -silta ei raportoi terveystilaa",
+      "description": "Casambi-silta ei vastaa terveysprotokollaan. Se on joko vanhempi silta tai ei ole juuri nyt käynnissä; näitä ei voi erottaa ennen kuin silta vastaa. Vanhemman sillan valot, scenet ja kytkimet toimivat edelleen, mutta jumittuneita päivityksiä ei voida havaita eikä palauttaa. Jos silta on käynnissä, päivitä se Bluetooth-isännällä tätä integraatiota vastaavaan julkaisuun. Ilmoitus poistuu itsestään, kun silta vastaa."
     }
   }
 }

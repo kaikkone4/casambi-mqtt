@@ -17,7 +17,16 @@
       "init": {
         "description": "{restart_note}",
         "data": {
-          "mqtt_network_name": "MQTT network name"
+          "mqtt_network_name": "MQTT network name",
+          "health_stale_seconds": "Bridge status considered stale after (seconds)",
+          "health_startup_grace_seconds": "Startup grace before health is judged (seconds)",
+          "health_probe_interval_seconds": "Bridge status probe interval (seconds, at least 300)",
+          "health_consumer_probe_interval_seconds": "Consumer snapshot probe interval (seconds, at least 300)",
+          "health_probe_deadline_seconds": "Probe reply deadline (seconds)",
+          "health_recovery_cooldown_seconds": "Minimum time between automatic entry reloads (seconds, at least 600)",
+          "health_stale_confirm_seconds": "Time between the two stale proofs before a reload (seconds, at least 90)",
+          "health_recovery_verify_seconds": "Time allowed to verify a reload (seconds)",
+          "health_recovery_enabled": "Reload this entry automatically when its updates are stuck"
         }
       }
     },
@@ -41,6 +50,20 @@
           }
         }
       }
+    },
+    "sensor": {
+      "health": {
+        "state": {
+          "starting": "Starting",
+          "healthy": "Healthy",
+          "bridge_unavailable": "Bridge unavailable",
+          "consumer_stale": "Updates stuck",
+          "recovering": "Recovering",
+          "recovery_failed": "Recovery failed",
+          "unsupported": "Bridge too old",
+          "degraded": "Degraded"
+        }
+      }
     }
   },
   "device_automation": {
@@ -49,6 +72,23 @@
       "release": "Button {subtype} released",
       "hold": "Button {subtype} held",
       "release_after_hold": "Button {subtype} released after hold"
+    }
+  },
+  "issues": {
+    "recovery_failed": {
+      "title": "Casambi MQTT automatic recovery stopped",
+      "fix_flow": {
+        "step": {
+          "confirm": {
+            "title": "Re-enable automatic recovery",
+            "description": "Home Assistant received Casambi state messages, but this Casambi MQTT entry did not process them, and automatic reloads of the entry did not fix it. No further automatic reloads are made. The reason is shown on the entry's Casambi health sensor. Check the Home Assistant log, then submit to re-enable automatic recovery for this entry within the normal limits."
+          }
+        }
+      }
+    },
+    "bridge_unsupported": {
+      "title": "Casambi MQTT bridge does not report health",
+      "description": "The Casambi bridge does not answer the health protocol. Either it is an older bridge, or it is not running at the moment; the two cannot be told apart until it answers. Lights, scenes and switches of an older bridge keep working, but stuck updates cannot be detected or recovered. If the bridge is running, update it on its Bluetooth host to the release that matches this integration. This notice disappears by itself once the bridge answers."
     }
   }
 }
