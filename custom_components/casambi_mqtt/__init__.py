@@ -22,6 +22,8 @@ from .const import (
 )
 from .entities.entities import Scene, Unit
 from .event import async_add_switch_buttons
+from .health import HealthObserver, HealthSettings
+from .health_monitor import HealthMonitor
 from .light import CasambiMqttLight
 from .runtime_data import CasambiMqttRuntimeData
 from .scene import CasambiMqttScene
@@ -238,7 +240,9 @@ async def async_setup_entry(  # noqa: PLR0915
     hass: HomeAssistant, entry: ConfigEntry
 ) -> bool:
     network_name = configured_network_name(entry.options, entry.data)
-    entry.runtime_data = CasambiMqttRuntimeData(network_name=network_name)
+    entry.runtime_data = CasambiMqttRuntimeData(
+        network_name=network_name, applied_options=dict(entry.options)
+    )
     switch_store = Store(
         hass, SWITCH_STORE_VERSION, f"{DOMAIN}.{entry.entry_id}.switch_buttons"
     )
@@ -250,6 +254,9 @@ async def async_setup_entry(  # noqa: PLR0915
     event_prefix = f"{MQTT_TOPIC_PREFIX}/{network_name}/events/"
     scene_prefix = f"{MQTT_TOPIC_PREFIX}/{network_name}/scenes/"
     switch_event_topic = f"{MQTT_TOPIC_PREFIX}/{network_name}/switch_events"
+    health = HealthObserver(HealthSettings.from_options(entry.options), event_prefix)
+    entry.runtime_data.health = health
+    health_monitor = HealthMonitor(hass, entry, network_name, health)
 
     async def event_processor(  # noqa: PLR0911, PLR0912
         msg: ReceiveMessage,
@@ -282,6 +289,9 @@ async def async_setup_entry(  # noqa: PLR0915
             LOGGER.warning("Invalid Casambi unit payload on topic %s", msg.topic)
             return
         if unit_kind != Unit.TYPE_LIGHT:
+            # A valid unit this entry deliberately does not represent: the
+            # consumer handled it, so it counts as processed.
+            health.on_processed_unit(msg.topic)
             return
 
         if unit.address:
@@ -311,6 +321,9 @@ async def async_setup_entry(  # noqa: PLR0915
             async_add_entities([light_entity])
         else:
             runtime_data.lights[msg.topic].update_entity(unit)
+        # Only after the entity callback returned: an unchanged value counts,
+        # a raised exception or an unready platform does not.
+        health.on_processed_unit(msg.topic)
 
     async def scene_processor(msg: ReceiveMessage) -> None:
         if not msg.payload or not msg.topic.startswith(scene_prefix):
@@ -363,15 +376,27 @@ async def async_setup_entry(  # noqa: PLR0915
                 1,
             )
         )
+        unsubscribers.extend(await health_monitor.async_subscribe(async_subscribe))
     except Exception:
         for unsubscribe in unsubscribers:
             unsubscribe()
         raise
     for unsubscribe in unsubscribers:
         entry.async_on_unload(unsubscribe)
+    # Changed options (network name, health settings) take effect by reloading
+    # only this entry.
+    entry.async_on_unload(entry.add_update_listener(_async_options_updated))
 
     LOGGER.debug("Casambi MQTT subscriptions set up for %s", network_name)
     return True
+
+
+async def _async_options_updated(hass: HomeAssistant, entry: ConfigEntry) -> None:
+    # The options flow also updates the unique ID, which fires this listener
+    # once more with the old options; only a real options change reloads.
+    if dict(entry.options) == entry.runtime_data.applied_options:
+        return
+    await hass.config_entries.async_reload(entry.entry_id)
 
 
 async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:

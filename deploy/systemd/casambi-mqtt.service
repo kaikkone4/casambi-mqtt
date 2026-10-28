@@ -1,0 +1,44 @@
+# Casambi MQTT bridge. Render the @PLACEHOLDERS@ before installing; see
+# docs/pi-recovery.md. Contains no credentials: those stay in the
+# deployment's private .env next to server.py.
+[Unit]
+Description=Casambi MQTT bridge
+Wants=bluetooth.target network-online.target
+After=bluetooth.service network-online.target
+# systemd's own restarts stop after 5 failures in 10 minutes. The bridge
+# itself already retries discovery/connect with backoff (about 1 minute per
+# process), so this bounds a failure loop to minutes instead of hours. The
+# recovery supervisor (OnFailure= and its timer) then decides whether one
+# budgeted Bluetooth reset is justified.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+OnFailure=casambi-mqtt-recovery.service
+
+[Service]
+Type=simple
+User=@BRIDGE_USER@
+Group=@BRIDGE_GROUP@
+WorkingDirectory=@INSTALL_DIR@
+ExecStart=@INSTALL_DIR@/.venv/bin/python server.py
+Environment=PYTHONUNBUFFERED=1
+Environment=HEALTH_RECORD_PATH=/run/casambi-mqtt/health.json
+# Exit 78 is a configuration error (bad setting, rejected Casambi login):
+# no restart or Bluetooth reset can fix it.
+Restart=on-failure
+RestartSec=10
+RestartPreventExitStatus=78
+# "+" runs this one hook as root: systemd passes the real exit in
+# $EXIT_CODE/$EXIT_STATUS for every exit, including each automatic restart,
+# and the root-owned supervisor counts BLE startup failures (76) from it.
+# RECOVERY_STATE_DIR must match casambi-mqtt-recovery.service.
+ExecStopPost=+/usr/bin/env RECOVERY_STATE_DIR=/var/lib/casambi-mqtt-recovery /usr/bin/python3 -I /usr/local/libexec/casambi-mqtt/bridge_recovery.py record-exit
+# SIGTERM runs the bridge's normal cleanup (BLE disconnect, offline status).
+TimeoutStopSec=30
+RuntimeDirectory=casambi-mqtt
+RuntimeDirectoryMode=0755
+RuntimeDirectoryPreserve=yes
+NoNewPrivileges=yes
+PrivateTmp=yes
+
+[Install]
+WantedBy=multi-user.target

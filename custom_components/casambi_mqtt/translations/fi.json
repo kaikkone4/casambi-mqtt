@@ -17,7 +17,12 @@
       "init": {
         "description": "{restart_note}",
         "data": {
-          "mqtt_network_name": "MQTT-verkon nimi"
+          "mqtt_network_name": "MQTT-verkon nimi",
+          "health_stale_seconds": "Sillan tila vanhenee (sekuntia)",
+          "health_startup_grace_seconds": "Käynnistyksen armonaika ennen terveysarviota (sekuntia)",
+          "health_probe_interval_seconds": "Sillan tilakyselyn väli (sekuntia, vähintään 300)",
+          "health_consumer_probe_interval_seconds": "Kulutuskokeen snapshot-väli (sekuntia, vähintään 300)",
+          "health_probe_deadline_seconds": "Kokeen vastauksen määräaika (sekuntia)"
         }
       }
     },
