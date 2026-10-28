@@ -7,6 +7,7 @@ COPY requirements-server.txt .
 RUN pip install --no-cache-dir -r requirements-server.txt
 
 COPY custom_components/casambi_mqtt/entities/ custom_components/casambi_mqtt/entities/
+COPY custom_components/casambi_mqtt/health_protocol.py custom_components/casambi_mqtt/
 # Apache-2.0 requires the licence and notices to travel with the artifact
 # that carries the adapted casambi-bt switch decoder.
 COPY THIRD_PARTY_LICENSES/ THIRD_PARTY_LICENSES/
