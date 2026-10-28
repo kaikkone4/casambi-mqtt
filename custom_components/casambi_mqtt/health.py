@@ -124,6 +124,7 @@ class ProbeOutcome(StrEnum):
     CONSUMER_PARTIAL = "consumer_partial"
     CONSUMER_STALE = "consumer_stale"
     NO_UNITS = "no_units"
+    SUPERSEDED = "superseded"
 
 
 class BridgeStatusTracker:
@@ -218,9 +219,27 @@ class PendingProbe:
     request_id: str
     sent_at: float
     deadline_at: float
+    instance_id: str | None = None
     reply: hp.HealthReply | None = None
-    raw_topics: set[str] = field(default_factory=set)
-    processed_topics: set[str] = field(default_factory=set)
+    # Messages per unit topic seen during the probe by the raw listener and
+    # by the real consumer. Only per-topic coverage of what actually arrived
+    # binds consumption to this snapshot; a bare count of handled topics
+    # could be satisfied by unrelated ambient updates.
+    raw_counts: dict[str, int] = field(default_factory=dict)
+    processed_counts: dict[str, int] = field(default_factory=dict)
+
+    @property
+    def raw_topics(self) -> set[str]:
+        return set(self.raw_counts)
+
+    @property
+    def processed_topics(self) -> set[str]:
+        """Window topics whose every received message the consumer handled."""
+        return {
+            topic
+            for topic, count in self.raw_counts.items()
+            if self.processed_counts.get(topic, 0) >= count
+        }
 
 
 @dataclass(frozen=True, slots=True)
@@ -243,11 +262,13 @@ class ProbeTracker:
     One correlated probe at a time, accepted only by its own fresh reply.
 
     A reply is accepted only when its request ID is the pending one, it
-    arrives before the deadline, and its instance matches the live bridge
-    instance (when one is known). A consumer probe then additionally needs
-    the entry's real callback to have handled at least as many distinct unit
-    topics as the bridge confirmed publishing. A reply alone never proves
-    consumption, and an MQTT PUBACK is never a reply.
+    arrives by the deadline, and its instance matches the live bridge
+    instance (when one is known). A consumer probe then additionally needs,
+    by the same deadline: at least as many distinct unit topics delivered as
+    the bridge confirmed publishing, and the entry's real callback to have
+    handled every unit message the raw listener saw during the probe. A
+    reply alone never proves consumption, an MQTT PUBACK is never a reply,
+    and nothing that happens after the deadline can make a probe succeed.
     """
 
     def __init__(
@@ -260,7 +281,9 @@ class ProbeTracker:
         self.pending: PendingProbe | None = None
         self.rejected_replies = 0
 
-    def start(self, kind: ProbeKind, now: float) -> PendingProbe | None:
+    def start(
+        self, kind: ProbeKind, now: float, instance_id: str | None = None
+    ) -> PendingProbe | None:
         if self.pending is not None:
             return None
         self.pending = PendingProbe(
@@ -268,6 +291,7 @@ class ProbeTracker:
             request_id=self._token(),
             sent_at=now,
             deadline_at=now + self.settings.probe_deadline_seconds,
+            instance_id=instance_id,
         )
         return self.pending
 
@@ -304,15 +328,48 @@ class ProbeTracker:
             return self._finish(ProbeOutcome.NO_UNITS, now)
         return self.check(now)
 
-    def record_raw(self, topic: str) -> None:
-        if self.pending is not None and self.pending.kind is ProbeKind.CONSUMER:
-            self.pending.raw_topics.add(topic)
+    def _collecting(self, now: float) -> PendingProbe | None:
+        pending = self.pending
+        if (
+            pending is None
+            or pending.kind is not ProbeKind.CONSUMER
+            or now > pending.deadline_at
+        ):
+            return None
+        return pending
+
+    def record_raw(self, topic: str, now: float) -> ProbeResult | None:
+        pending = self._collecting(now)
+        if pending is None:
+            return self.check(now)
+        pending.raw_counts[topic] = pending.raw_counts.get(topic, 0) + 1
+        return None
 
     def record_processed(self, topic: str, now: float) -> ProbeResult | None:
-        if self.pending is None or self.pending.kind is not ProbeKind.CONSUMER:
-            return None
-        self.pending.processed_topics.add(topic)
+        pending = self._collecting(now)
+        if pending is None:
+            # After the deadline: expire first, never count late evidence.
+            return self.check(now)
+        pending.processed_counts[topic] = pending.processed_counts.get(topic, 0) + 1
         return self.check(now)
+
+    def supersede(self, now: float, instance_id: str | None) -> ProbeResult | None:
+        """
+        End the pending probe without a verdict if the bridge instance changed.
+
+        Evidence gathered for one bridge process can never certify another;
+        a probe spanning an instance change is inconclusive, not OK.
+        """
+        pending = self.pending
+        if pending is None or instance_id is None:
+            return None
+        started_on = pending.instance_id
+        replied_by = None if pending.reply is None else pending.reply.instance_id
+        if (started_on is not None and started_on != instance_id) or (
+            replied_by is not None and replied_by != instance_id
+        ):
+            return self._finish(ProbeOutcome.SUPERSEDED, now)
+        return None
 
     def check(self, now: float) -> ProbeResult | None:  # noqa: PLR0911
         """Finish the pending probe if it has succeeded or its deadline passed."""
@@ -320,21 +377,22 @@ class ProbeTracker:
         if pending is None:
             return None
         reply = pending.reply
-        if (
-            pending.kind is ProbeKind.CONSUMER
-            and reply is not None
-            and reply.units
-            and len(pending.processed_topics) >= reply.units
-        ):
-            return self._finish(ProbeOutcome.OK, now)
         if now <= pending.deadline_at:
+            if (
+                pending.kind is ProbeKind.CONSUMER
+                and reply is not None
+                and reply.units
+                and len(pending.raw_counts) >= reply.units
+                and len(pending.processed_topics) == len(pending.raw_counts)
+            ):
+                return self._finish(ProbeOutcome.OK, now)
             return None
         if reply is None:
             return self._finish(ProbeOutcome.NO_REPLY, now)
         units = reply.units or 0
-        if len(pending.raw_topics) < units:
+        if len(pending.raw_counts) < units:
             return self._finish(ProbeOutcome.DELIVERY_INCOMPLETE, now)
-        if not pending.processed_topics:
+        if not any(pending.processed_counts.get(topic) for topic in pending.raw_counts):
             # Everything reached Home Assistant and nothing was handled.
             return self._finish(ProbeOutcome.CONSUMER_STALE, now)
         # Some units were handled: the consumer runs, but a few payloads were
@@ -354,7 +412,7 @@ class ProbeTracker:
             outcome=outcome,
             finished_at=now,
             expected_units=None if reply is None else reply.units,
-            raw_units=len(pending.raw_topics),
+            raw_units=len(pending.raw_counts),
             processed_units=len(pending.processed_topics),
         )
 
@@ -423,7 +481,9 @@ class HealthObserver:
         )
 
     def on_status(self, payload: str | bytes, *, retain: bool) -> None:
-        self.bridge.on_message(payload, retain=retain, now=self.now())
+        now = self.now()
+        if self.bridge.on_message(payload, retain=retain, now=now):
+            self._publish_result(self.probes.supersede(now, self.bridge.instance_id))
 
     def on_reply(self, payload: str | bytes) -> None:
         self._publish_result(
@@ -436,8 +496,9 @@ class HealthObserver:
         if not payload or not is_unit_event_topic(topic, self.event_prefix):
             return
         self.consumer.raw_messages += 1
-        self.consumer.last_raw_at = self.now()
-        self.probes.record_raw(topic)
+        now = self.now()
+        self.consumer.last_raw_at = now
+        self._publish_result(self.probes.record_raw(topic, now))
 
     def on_processed_unit(self, topic: str) -> None:
         if not is_unit_event_topic(topic, self.event_prefix):
@@ -471,7 +532,7 @@ class HealthObserver:
 
     def start_probe(self, kind: ProbeKind) -> PendingProbe | None:
         now = self.now()
-        probe = self.probes.start(kind, now)
+        probe = self.probes.start(kind, now, self.bridge.instance_id)
         if probe is not None:
             interval = (
                 self.settings.consumer_probe_interval_seconds

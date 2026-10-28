@@ -736,3 +736,134 @@ async def test_network_rename_sets_the_entry_up_once_with_new_options(hass, mqtt
     assert len(setups) == 1
     assert setups[0][CONF_NETWORK_NAME] == "renamed"
     assert await hass.config_entries.async_unload(entry.entry_id)
+
+
+# ---------------------------------------------------------------------------
+# Owner review of e32a3f0: evidence binding, deadline, parser robustness
+# ---------------------------------------------------------------------------
+
+
+def snapshot_reply(probe, units, instance=INSTANCE_A):
+    return reply(
+        probe.request_id, instance=instance, reply_type=hp.REPLY_SNAPSHOT, units=units
+    )
+
+
+def test_ambient_handling_cannot_certify_an_unprocessed_snapshot():
+    clock = FakeClock()
+    obs = healthy_observer(clock)
+    probe = obs.start_probe(ProbeKind.CONSUMER)
+    # An ordinary ambient update of another unit is handled ...
+    obs.on_raw_unit(f"{EVENT_PREFIX}ambient", "x")
+    obs.on_processed_unit(f"{EVENT_PREFIX}ambient")
+    # ... but the snapshot's own unit only reaches the raw listener.
+    obs.on_raw_unit(f"{EVENT_PREFIX}snap", "x")
+    obs.on_reply(snapshot_reply(probe, units=1))
+    assert ProbeKind.CONSUMER not in obs.last_result
+    clock.now += 21
+    obs.tick()
+    assert obs.last_result[ProbeKind.CONSUMER].outcome is not ProbeOutcome.OK
+    assert ProbeKind.CONSUMER not in obs.last_ok
+
+
+def test_raw_only_snapshot_without_ambient_is_stale():
+    clock = FakeClock()
+    obs = healthy_observer(clock)
+    probe = obs.start_probe(ProbeKind.CONSUMER)
+    obs.on_raw_unit(f"{EVENT_PREFIX}snap", "x")
+    obs.on_reply(snapshot_reply(probe, units=1))
+    clock.now += 21
+    obs.tick()
+    assert obs.last_result[ProbeKind.CONSUMER].outcome is ProbeOutcome.CONSUMER_STALE
+
+
+def test_every_message_of_a_topic_must_be_handled():
+    clock = FakeClock()
+    obs = healthy_observer(clock)
+    probe = obs.start_probe(ProbeKind.CONSUMER)
+    topic = f"{EVENT_PREFIX}a"
+    obs.on_raw_unit(topic, "ambient")
+    obs.on_processed_unit(topic)
+    obs.on_raw_unit(topic, "snapshot")  # the snapshot message is not handled
+    obs.on_reply(snapshot_reply(probe, units=1))
+    assert ProbeKind.CONSUMER not in obs.last_result
+    obs.on_processed_unit(topic)
+    assert obs.last_result[ProbeKind.CONSUMER].outcome is ProbeOutcome.OK
+
+
+def test_new_bridge_instance_fences_pending_evidence():
+    clock = FakeClock()
+    obs = healthy_observer(clock)
+    probe = obs.start_probe(ProbeKind.CONSUMER)
+    obs.on_raw_unit(f"{EVENT_PREFIX}x", "a")
+    obs.on_processed_unit(f"{EVENT_PREFIX}x")
+    obs.on_reply(snapshot_reply(probe, units=2))
+    obs.on_status(
+        status(INSTANCE_B, sequence=1, phase=hp.PHASE_STARTING).to_json(),
+        retain=False,
+    )
+    assert obs.last_result[ProbeKind.CONSUMER].outcome is ProbeOutcome.SUPERSEDED
+    obs.on_raw_unit(f"{EVENT_PREFIX}y", "b")
+    obs.on_processed_unit(f"{EVENT_PREFIX}y")
+    assert ProbeKind.CONSUMER not in obs.last_ok
+
+
+def test_instance_change_before_the_reply_also_fences():
+    clock = FakeClock()
+    obs = healthy_observer(clock)
+    probe = obs.start_probe(ProbeKind.CONSUMER)
+    obs.on_status(status(INSTANCE_B, sequence=1).to_json(), retain=False)
+    assert obs.last_result[ProbeKind.CONSUMER].outcome is ProbeOutcome.SUPERSEDED
+    obs.on_reply(snapshot_reply(probe, units=1, instance=INSTANCE_B))
+    assert ProbeKind.CONSUMER not in obs.last_ok
+
+
+def _deadline_case(clock, *, callback_at, tick_first):
+    obs = healthy_observer(clock)
+    probe = obs.start_probe(ProbeKind.CONSUMER)  # deadline = start + 20
+    deadline = probe.deadline_at
+    topic = f"{EVENT_PREFIX}a"
+    obs.on_raw_unit(topic, "x")
+    obs.on_reply(snapshot_reply(probe, units=1))
+    clock.now = deadline + (callback_at - 110)
+    if tick_first:
+        obs.tick()
+    obs.on_processed_unit(topic)
+    obs.tick()
+    return obs.last_result[ProbeKind.CONSUMER].outcome
+
+
+@pytest.mark.parametrize(
+    ("callback_at", "tick_first", "expected"),
+    [
+        (109, False, ProbeOutcome.OK),
+        (110, False, ProbeOutcome.OK),  # the deadline itself is still in time
+        (111, False, ProbeOutcome.CONSUMER_STALE),
+        (111, True, ProbeOutcome.CONSUMER_STALE),
+    ],
+)
+def test_deadline_is_enforced_before_success(callback_at, tick_first, expected):
+    assert (
+        _deadline_case(FakeClock(), callback_at=callback_at, tick_first=tick_first)
+        is expected
+    )
+
+
+@pytest.mark.parametrize("bad", [["ready"], {"x": 1}])
+@pytest.mark.parametrize("key", ["phase", "ble", "mqtt", "error"])
+def test_status_parser_rejects_non_string_enums_without_raising(key, bad):
+    assert hp.parse_status(json.dumps(status().as_dict() | {key: bad})) is None
+
+
+@pytest.mark.parametrize("bad", [["status"], {"x": 1}])
+@pytest.mark.parametrize("key", ["type", "result"])
+def test_reply_parser_rejects_non_string_enums_without_raising(key, bad):
+    payload = json.loads(reply("req-1"))
+    payload[key] = bad
+    assert hp.parse_reply(json.dumps(payload)) is None
+
+
+@pytest.mark.parametrize("value", ["unknown-phase", "ready"])
+def test_status_parser_string_controls(value):
+    parsed = hp.parse_status(json.dumps(status().as_dict() | {"phase": value}))
+    assert (parsed is not None) == (value == "ready")
