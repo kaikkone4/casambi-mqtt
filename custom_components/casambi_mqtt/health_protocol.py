@@ -128,6 +128,11 @@ def is_valid_instance_id(value: object) -> bool:
     return isinstance(value, str) and _INSTANCE_ID.fullmatch(value) is not None
 
 
+def _is_member(value: object, allowed: frozenset[str]) -> bool:
+    """Fail closed on any non-string (a list or object is not an enum value)."""
+    return isinstance(value, str) and value in allowed
+
+
 def _is_counter(value: object) -> bool:
     return (
         isinstance(value, int)
@@ -270,12 +275,12 @@ def _status_from_dict(value: object) -> BridgeStatus | None:
     if (
         not is_valid_instance_id(value["instance_id"])
         or not _is_optional_counter(value["sequence"])
-        or value["phase"] not in PHASES
-        or value["ble"] not in LINK_STATES
-        or value["mqtt"] not in LINK_STATES
+        or not _is_member(value["phase"], PHASES)
+        or not _is_member(value["ble"], LINK_STATES)
+        or not _is_member(value["mqtt"], LINK_STATES)
         or not _is_optional_counter(value["uptime_s"])
         or snapshot is None
-        or value["error"] not in ERROR_CATEGORIES
+        or not _is_member(value["error"], ERROR_CATEGORIES)
         or not (time is None or (isinstance(time, str) and len(time) <= 40))  # noqa: PLR2004
     ):
         return None
@@ -310,7 +315,7 @@ def parse_reply(  # noqa: PLR0911
         return None
     reply_type = value.get("type")
     expected_keys = SNAPSHOT_REPLY_KEYS if reply_type == REPLY_SNAPSHOT else REPLY_KEYS
-    if set(value) != expected_keys or reply_type not in REPLY_TYPES:
+    if set(value) != expected_keys or not _is_member(reply_type, REPLY_TYPES):
         return None
     if type(value["protocol_version"]) is not int or (
         value["protocol_version"] != PROTOCOL_VERSION
@@ -322,7 +327,7 @@ def parse_reply(  # noqa: PLR0911
         or not is_valid_request_id(value["request_id"])
         or not is_valid_instance_id(value["instance_id"])
         or value["instance_id"] != status.instance_id
-        or value["result"] not in RESULTS
+        or not _is_member(value["result"], RESULTS)
     ):
         return None
     if reply_type == REPLY_SNAPSHOT:
