@@ -429,6 +429,7 @@ class HealthCoordinator:
         # None: the first update always syncs the issue, so a reload after a
         # bridge upgrade removes a warning left by the previous setup.
         self._unsupported_issue: bool | None = None
+        self._published: dict[str, Any] | None = None
         self.last_consumer: ProbeResult | None = None
         observer.listeners.append(self._on_probe_result)
         manager.listeners.append(self.async_update)
@@ -481,9 +482,15 @@ class HealthCoordinator:
     def async_update(self) -> None:
         state, reason = self._compute()
         self._update_unsupported_issue(state)
-        if (state, reason) == (self.state, self.reason):
-            return
         self.state, self.reason = state, reason
+        # Publish whenever anything the sensor shows changed -- not only the
+        # verdict: a newer successful probe or an expiring reload window
+        # changes its attributes while state and reason stay the same. This
+        # runs on every health tick, so time-based values stay current.
+        published = self.diagnostics()
+        if published == self._published:
+            return
+        self._published = published
         for listener in list(self.listeners):
             listener()
 

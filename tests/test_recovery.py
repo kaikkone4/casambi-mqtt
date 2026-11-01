@@ -822,3 +822,41 @@ async def test_superseded_probe_keeps_the_verdict_and_breaks_the_streak(
         assert h.coordinator.state is ConsumerState.CONSUMER_STALE
         assert h.reloads == 0
         await hass.config_entries.async_unload(h.entry.entry_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expected_lingering_timers", [True])
+async def test_sensor_attributes_follow_diagnostics_while_state_is_unchanged(
+    hass, mqtt_bridge
+):
+    from homeassistant.helpers import entity_registry as er
+
+    with ExitStack() as stack:
+        h = await mqtt_bridge(stack=stack)
+        await healthy_start(h)
+        entity_id = er.async_get(hass).async_get_entity_id(
+            "sensor", DOMAIN, f"{h.entry.entry_id}_casambi_mqtt_health"
+        )
+        first = hass.states.get(entity_id)
+        assert first.state == "healthy"
+
+        # A newer successful probe: same state and reason, newer timestamp.
+        h.coordinator.last_consumer_ok = "2000-01-01T00:00:00+00:00"
+        h.coordinator.async_update()
+        await h.settle()
+        assert (
+            hass.states.get(entity_id).attributes["last_consumer_ok"]
+            == "2000-01-01T00:00:00+00:00"
+        )
+
+        # The rolling reload count falls back once its window expires.
+        h.manager.reloads = [h.clock.wall - 60]
+        h.coordinator.async_update()
+        await h.settle()
+        assert hass.states.get(entity_id).attributes["reloads_last_30_min"] == 1
+        h.clock.advance(1800)
+        await h.tick()
+        state = hass.states.get(entity_id)
+        assert state.state == "healthy"
+        assert state.attributes["reloads_last_30_min"] == 0
+        await hass.config_entries.async_unload(h.entry.entry_id)
