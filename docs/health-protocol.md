@@ -152,9 +152,13 @@ Home Assistant uses the **local monotonic receipt time** of each message.
   - at least as many distinct unit topics reached Home Assistant during the
     probe as the bridge confirmed publishing, and
   - the entry's **real unit callback** handled **every** unit message that
-    the separate raw listener saw during the probe, counted per topic.
-  Handling of unrelated ambient updates therefore cannot certify a snapshot
-  whose own messages were not handled. An unchanged dimmer value counts as
+    the separate raw listener saw during the probe, matched **per message**:
+    Home Assistant hands both callbacks the same MQTT message, with the same
+    receipt timestamp, so topic plus timestamp identifies it.
+  Handling of unrelated ambient updates, or of a later message on the same
+  topic, therefore cannot certify a snapshot message that was not handled,
+  whichever callback runs first. A message without that identity can never
+  certify a probe. An unchanged dimmer value counts as
   handled. Nothing after the deadline counts. Outcomes:
   - full raw delivery with **nothing** handled: `consumer_stale`;
   - some handled but not all: `consumer_partial` (degraded);
@@ -164,8 +168,9 @@ Home Assistant uses the **local monotonic receipt time** of each message.
     is inconclusive. Evidence from one bridge process never certifies another.
 
 What remains uncorrelated: unit payloads carry no snapshot identifier
-(changing them would break older consumers), so the per-topic coverage
-above, bounded by the probe window, is the binding.
+(changing them would break older consumers). The binding is therefore "every
+unit message delivered during the probe window was handled", not "these were
+exactly the snapshot's messages".
 
 ## What this does not prove
 

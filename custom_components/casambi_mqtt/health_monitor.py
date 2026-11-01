@@ -86,7 +86,9 @@ class HealthMonitor:
 
     @callback
     def _on_raw_unit(self, msg: ReceiveMessage) -> None:
-        self.observer.on_raw_unit(msg.topic, msg.payload)
+        # The receipt timestamp is shared by every subscriber of this one
+        # message, so it identifies the message across the two callbacks.
+        self.observer.on_raw_unit(msg.topic, msg.payload, msg.timestamp)
 
     @callback
     def _on_tick(self, _now: object = None) -> None:
