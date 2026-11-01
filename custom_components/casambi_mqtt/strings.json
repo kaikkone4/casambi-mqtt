@@ -17,7 +17,12 @@
       "init": {
         "description": "{restart_note}",
         "data": {
-          "mqtt_network_name": "MQTT network name"
+          "mqtt_network_name": "MQTT network name",
+          "health_stale_seconds": "Bridge status considered stale after (seconds)",
+          "health_startup_grace_seconds": "Startup grace before health is judged (seconds)",
+          "health_probe_interval_seconds": "Bridge status probe interval (seconds, at least 300)",
+          "health_consumer_probe_interval_seconds": "Consumer snapshot probe interval (seconds, at least 300)",
+          "health_probe_deadline_seconds": "Probe reply deadline (seconds)"
         }
       }
     },

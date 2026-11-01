@@ -59,6 +59,10 @@ async def test_valid_switch_event_discovers_device_and_triggers(hass):
         "casambi/test/events/#",
         "casambi/test/scenes/#",
         "casambi/test/switch_events",
+        # Health protocol v1: status, correlated replies, raw delivery count.
+        "casambi/test/status",
+        "casambi/test/health/reply",
+        "casambi/test/events/#",
     ]
     assert subscriptions[2][2] == 1
 
@@ -321,7 +325,8 @@ async def test_entry_unload_removes_all_runtime_subscriptions(hass):
     ):
         assert await integration.async_setup_entry(hass, entry)
 
-    assert len(unsubscribers) == 3
+    # Three entity subscriptions plus three health-protocol subscriptions.
+    assert len(unsubscribers) == 6
     await entry._async_process_on_unload(hass)
     for unsubscribe in unsubscribers:
         unsubscribe.assert_called_once_with()

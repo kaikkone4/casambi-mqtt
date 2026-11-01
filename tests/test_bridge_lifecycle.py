@@ -63,6 +63,10 @@ def load_server_module():
                 ROOT / "custom_components/casambi_mqtt/const.py",
             ),
             (
+                "custom_components.casambi_mqtt.health_protocol",
+                ROOT / "custom_components/casambi_mqtt/health_protocol.py",
+            ),
+            (
                 "custom_components.casambi_mqtt.entities.commands",
                 ROOT / "custom_components/casambi_mqtt/entities/commands.py",
             ),
@@ -1576,7 +1580,9 @@ async def test_main_reconnects_normally_on_mqtt_error_when_not_disconnected(
     casa = FakeMainCasa()
     attempts = []
 
-    async def fake_run_connected_bridge(casa_arg, client_arg, disconnected_arg):
+    async def fake_run_connected_bridge(
+        casa_arg, client_arg, disconnected_arg, health_arg=None, **_kwargs
+    ):
         attempts.append("run")
         if len(attempts) == 1:
             raise aiomqtt.MqttError("boom")

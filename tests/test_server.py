@@ -55,6 +55,10 @@ def load_server_module():
                 ROOT / "custom_components/casambi_mqtt/const.py",
             ),
             (
+                "custom_components.casambi_mqtt.health_protocol",
+                ROOT / "custom_components/casambi_mqtt/health_protocol.py",
+            ),
+            (
                 "custom_components.casambi_mqtt.entities.commands",
                 ROOT / "custom_components/casambi_mqtt/entities/commands.py",
             ),
