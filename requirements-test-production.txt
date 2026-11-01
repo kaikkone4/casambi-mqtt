@@ -1,0 +1,4 @@
+# Home Assistant Core 2026.10.4, matching the production verification target.
+# Keep requirements-test.txt as the separate Core 2026.8.2 compatibility target.
+pytest-homeassistant-custom-component==0.13.375
+dataclasses-json==0.6.7
