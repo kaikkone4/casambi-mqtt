@@ -1,7 +1,7 @@
 # Home Assistant custom-component integration tests. Pinned to the Home
-# Assistant Core release this integration is verified against (2026.8.2), so
-# device-automation discovery is exercised on the same code the production
-# instance runs. Bridge and HA tests still run separately: the bridge's
+# Assistant Core compatibility target (2026.8.2). The production verification
+# target (2026.10.4) is pinned in requirements-test-production.txt.
+# Bridge and HA tests still run separately: the bridge's
 # aiomqtt stack is installed from requirements-dev.txt.
 pytest-homeassistant-custom-component==0.13.356
 dataclasses-json==0.6.7

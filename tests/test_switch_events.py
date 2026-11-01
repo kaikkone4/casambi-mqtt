@@ -12,6 +12,8 @@ from custom_components.casambi_mqtt.switch_events import DEFAULT_SWITCH_BUTTONS
 from homeassistant.components.device_automation import InvalidDeviceAutomationConfig
 from homeassistant.helpers import device_registry as dr, entity_registry as er
 
+from tests.helpers import get_device_by_identifier
+
 
 def _expected_triggers(device_id, observed_buttons):
     """The standard buttons plus whatever else has actually been observed."""
@@ -74,7 +76,9 @@ async def test_valid_switch_event_discovers_device_and_triggers(hass):
     )
 
     registry = dr.async_get(hass)
-    device = registry.async_get_device(identifiers={(DOMAIN, f"{entry.entry_id}:switch:7")})
+    device = get_device_by_identifier(
+        registry, (DOMAIN, f"{entry.entry_id}:switch:7"), entry.entry_id
+    )
     assert device is not None
     assert device.name == "Casambi switch 7"
     assert device.manufacturer == "Casambi"
