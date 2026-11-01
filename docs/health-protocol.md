@@ -55,8 +55,9 @@ task, and once more, bounded to 2 s, when the session ends on purpose.
   instance. It is `null` only in the last will.
 - `phase`: `starting`, `discovering`, `connecting`, `ready`, `degraded`,
   or `offline`. `discovering`/`connecting` happen before an MQTT session
-  exists; they are listed for the local startup record of a later change and
-  are not published over MQTT today.
+  exists and are kept in the local health record (docs/pi-recovery.md). When
+  startup finally fails, the bridge publishes `phase=offline` with the failure
+  category over a short, bounded MQTT session before it exits.
 - `ble`, `mqtt`: `connected`, `disconnected` or `unknown`, as the bridge
   believes them.
 - `uptime_s`, `snapshot.age_s`: monotonic-clock durations.

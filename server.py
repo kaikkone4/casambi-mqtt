@@ -3,6 +3,7 @@ import contextlib
 import json
 import logging
 import os
+import random
 import re
 import secrets
 import signal
@@ -11,7 +12,8 @@ import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, fields
 from datetime import UTC, datetime
-from typing import TYPE_CHECKING, Any
+from pathlib import Path
+from typing import Any
 from urllib.parse import quote
 
 import aiomqtt
@@ -38,9 +40,6 @@ from custom_components.casambi_mqtt.entities.entities import (
 )
 from switch_decoder import install_switch_event_decoder
 
-if TYPE_CHECKING:
-    from bleak import BLEDevice
-
 TOPIC_PREFIX = "casambi"
 MAX_BRIGHTNESS = 255
 SWITCH_PROBE_SECONDS = 90
@@ -48,6 +47,23 @@ MAX_SWITCH_EVENT_VALUE = 255
 SWITCH_EVENT_DEDUP_SECONDS = 0.25
 SUPPORTED_SWITCH_EVENTS = frozenset({"PRESS", "RELEASE", "HOLD", "RELEASE_AFTER_HOLD"})
 EXIT_BLE_DISCONNECTED = 75
+EXIT_BLE_STARTUP_FAILED = 76
+EXIT_CONFIGURATION = 78  # EX_CONFIG: systemd units use RestartPreventExitStatus=78
+EXIT_STARTUP_FAILED_OTHER = 79  # network not found or unclassified: no BLE reset
+STARTUP_ATTEMPTS = 6
+STARTUP_BACKOFF_SECONDS = (1, 2, 4, 8, 16)
+STARTUP_BACKOFF_CAP_SECONDS = 30
+STARTUP_BACKOFF_JITTER = 0.2
+DISCOVERY_DEADLINE_SECONDS = 30.0
+CONNECT_DEADLINE_SECONDS = 90.0
+BLE_CLEANUP_TIMEOUT = 10.0
+# How long a cancelled BLE operation may take to unwind. bleak's scanner stop
+# is a D-Bus call without a timeout -- the very call that failed on
+# 27.10.2026 -- so a cancelled attempt can hang in its own cleanup.
+BLE_CANCEL_GRACE = 10.0
+STARTUP_REPORT_TIMEOUT = 10.0
+BLUEZ_IN_PROGRESS = "org.bluez.Error.InProgress"
+HEALTH_RECORD_VERSION = 1
 DRAIN_TIMEOUT = 2.0
 SWITCH_EVENT_QUEUE_MAX = 64
 HEARTBEAT_SECONDS = 5
@@ -75,6 +91,7 @@ NETWORK_NAME = os.getenv("CASAMBI_NETWORK_NAME", "default")
 HEALTH_HEARTBEAT_SECONDS = os.getenv(
     "HEALTH_HEARTBEAT_SECONDS", str(DEFAULT_HEALTH_HEARTBEAT_SECONDS)
 )
+HEALTH_RECORD_PATH = os.getenv("HEALTH_RECORD_PATH")
 LOGGER = logging.getLogger(__name__)
 LOGGER.setLevel(LOG_LEVEL)
 handler = logging.StreamHandler()
@@ -220,6 +237,40 @@ class BridgeDiagnostics:
         )
 
 
+class BridgeConfigurationError(RuntimeError):
+    """A configuration problem that no restart or Bluetooth reset can fix."""
+
+
+class StartupFailedError(RuntimeError):
+    """
+    Discovery or connect failed after the bounded retries.
+
+    Carries only a fixed failure category from health_protocol, never the
+    underlying exception text (which can contain addresses or cloud data).
+    """
+
+    def __init__(self, category: str, *, wedged: bool = False) -> None:
+        super().__init__("Casambi startup failed")
+        self.category = category
+        self.wedged = wedged
+
+
+class _BleWedgedError(Exception):
+    """A cancelled BLE operation did not unwind within BLE_CANCEL_GRACE."""
+
+
+def _hard_exit(code: int) -> None:
+    """
+    Leave immediately, without unwinding the event loop.
+
+    Used only when a BLE call ignores cancellation: asyncio.run() would wait
+    for that task forever at shutdown, which is exactly the stuck-but-alive
+    state that must never happen. Logs are flushed first.
+    """
+    logging.shutdown()
+    os._exit(code)
+
+
 def health_heartbeat_seconds() -> int:
     """Return the validated status heartbeat interval, or raise on bad config."""
     try:
@@ -231,8 +282,90 @@ def health_heartbeat_seconds() -> int:
             "HEALTH_HEARTBEAT_SECONDS must be an integer between "
             f"{MIN_HEALTH_HEARTBEAT_SECONDS} and {MAX_HEALTH_HEARTBEAT_SECONDS}"
         )
-        raise RuntimeError(message)
+        raise BridgeConfigurationError(message)
     return value
+
+
+def _read_text(path: str) -> str | None:
+    try:
+        return Path(path).read_text(encoding="ascii").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
+def process_start_ticks(pid: int | str = "self") -> int | None:
+    """Return field 22 of /proc/<pid>/stat: start time in ticks since boot."""
+    stat = _read_text(f"/proc/{pid}/stat")
+    if stat is None or ")" not in stat:
+        return None
+    # The command name (field 2) may contain spaces and parentheses, so split
+    # after its closing parenthesis; starttime is then the 20th field.
+    fields_after_comm = stat.rsplit(")", 1)[1].split()
+    try:
+        return int(fields_after_comm[19])
+    except (IndexError, ValueError):
+        return None
+
+
+def current_boot_id() -> str | None:
+    return _read_text("/proc/sys/kernel/random/boot_id")
+
+
+class HealthRecord:
+    """
+    Small local health record for a root-owned supervisor (issue #27).
+
+    Lets the bridge's state be observed before any MQTT connection exists.
+    The file is replaced atomically (write to a temporary file in the same
+    directory, then ``os.replace``) and never appended to. It identifies the
+    writing process by PID, kernel start time and boot ID, so a record left
+    by a previous process -- or a previous boot -- can never make a new
+    process look healthy. ``updated_monotonic`` uses CLOCK_MONOTONIC, which on
+    Linux is shared by every process of the same boot.
+
+    The supervisor treats every field as untrusted input. The record contains
+    fixed enums, integers and random IDs only.
+    """
+
+    def __init__(
+        self, path: str, *, monotonic: Callable[[], float] = time.monotonic
+    ) -> None:
+        self.path = Path(path)
+        self._monotonic = monotonic
+        self._pid = os.getpid()
+        self._start_ticks = process_start_ticks()
+        self._boot_id = current_boot_id()
+        self._failed = False
+
+    def write(self, health: "BridgeHealth") -> None:
+        data = {
+            "record_version": HEALTH_RECORD_VERSION,
+            "instance_id": health.instance_id,
+            "pid": self._pid,
+            "start_ticks": self._start_ticks,
+            "boot_id": self._boot_id,
+            "phase": health.phase,
+            "error": health.error,
+            "ble": health.ble,
+            "mqtt": health.mqtt,
+            "ever_ready": health.ever_ready,
+            "mqtt_reconnects": health.mqtt_reconnects,
+            "ready_since_monotonic": health.ready_since,
+            "updated_monotonic": self._monotonic(),
+        }
+        temporary = self.path.with_name(f".{self.path.name}.{self._pid}.tmp")
+        try:
+            temporary.write_text(json.dumps(data, separators=(",", ":")))
+            temporary.chmod(0o644)
+            temporary.replace(self.path)
+        except OSError:
+            with contextlib.suppress(OSError):
+                temporary.unlink()
+            if not self._failed:
+                self._failed = True
+                LOGGER.warning("Unable to write the local bridge health record")
+            return
+        self._failed = False
 
 
 @dataclass(frozen=True)
@@ -276,8 +409,13 @@ class BridgeHealth:
         monotonic: Callable[[], float] = time.monotonic,
         wall_clock: Callable[[], str] = _utc_now,
         instance_id: str | None = None,
+        record: HealthRecord | None = None,
     ) -> None:
         self.instance_id = instance_id or secrets.token_hex(16)
+        self.record = record
+        self.ever_ready = False
+        self.mqtt_reconnects = 0
+        self.ready_since: float | None = None
         self._monotonic = monotonic
         self._wall_clock = wall_clock
         self._started = monotonic()
@@ -298,8 +436,20 @@ class BridgeHealth:
         return f"BridgeHealth(phase={self.phase}, sequence={self.sequence})"
 
     def set_phase(self, phase: str, error: str = health_protocol.ERROR_NONE) -> None:
+        if phase == health_protocol.PHASE_READY:
+            if self.phase != health_protocol.PHASE_READY:
+                self.ready_since = self._monotonic()
+            self.ever_ready = True
+        else:
+            self.ready_since = None
         self.phase = phase
         self.error = error
+        self.persist()
+
+    def persist(self) -> None:
+        """Refresh the local health record, if one is configured."""
+        if self.record is not None:
+            self.record.write(self)
 
     def session_started(self) -> None:
         """Start a new MQTT session at ``starting`` until its snapshot lands."""
@@ -391,6 +541,9 @@ class BridgeHealth:
         publish_timeout: float = HEALTH_PUBLISH_TIMEOUT,
     ) -> bool:
         """Publish one retained status, bounded so it can never block a caller."""
+        # The local record follows every heartbeat attempt, so its freshness
+        # never depends on the broker being reachable.
+        self.persist()
         try:
             await asyncio.wait_for(
                 client.publish(
@@ -1572,6 +1725,186 @@ async def run_connected_bridge(  # noqa: PLR0915
             await _publish_final_status(health, client, diagnostics, final_status)
 
 
+class _NetworkNotFoundError(Exception):
+    """The configured network was not among the discovered devices."""
+
+
+# Exit 76 means exactly these: the only failures a Bluetooth reset may fix.
+BLE_STARTUP_FAILURES = frozenset(
+    {
+        health_protocol.ERROR_BLE_DISCOVERY_IN_PROGRESS,
+        health_protocol.ERROR_BLE_DISCOVERY_FAILED,
+        health_protocol.ERROR_BLE_CONNECT_FAILED,
+    }
+)
+_TRANSIENT_STARTUP_ERRORS = frozenset(
+    {
+        health_protocol.ERROR_BLE_DISCOVERY_IN_PROGRESS,
+        health_protocol.ERROR_BLE_DISCOVERY_FAILED,
+        health_protocol.ERROR_BLE_CONNECT_FAILED,
+        health_protocol.ERROR_NETWORK_NOT_FOUND,
+    }
+)
+_MAX_EXCEPTION_CHAIN = 8
+
+
+def _exception_chain(error: BaseException) -> list[BaseException]:
+    chain: list[BaseException] = []
+    current: BaseException | None = error
+    while current is not None and current not in chain:
+        chain.append(current)
+        if len(chain) >= _MAX_EXCEPTION_CHAIN:
+            break
+        current = current.__cause__ or current.__context__
+    return chain
+
+
+def bluez_error_code(error: BaseException) -> str | None:
+    """
+    Return the stable D-Bus error name from a (wrapped) BlueZ failure.
+
+    casambi-bt 0.3.2 ``discover()`` re-raises bleak's ``BleakDBusError`` as
+    ``BluetoothError(e.dbus_error, e.dbus_error_details) from e``: the name is
+    both the wrapper's first argument and the cause's ``dbus_error``
+    property. Only that machine-readable name is used -- never the
+    human-readable, possibly localized details.
+    """
+    for item in _exception_chain(error):
+        code = getattr(item, "dbus_error", None)
+        if isinstance(code, str) and code.startswith("org."):
+            return code
+        args = getattr(item, "args", ())
+        if args and isinstance(args[0], str) and args[0].startswith("org.bluez."):
+            return args[0]
+    return None
+
+
+def classify_startup_error(error: BaseException, stage: str) -> str:
+    """Map a discovery/connect failure to one fixed health_protocol category."""
+    if bluez_error_code(error) == BLUEZ_IN_PROGRESS:
+        return health_protocol.ERROR_BLE_DISCOVERY_IN_PROGRESS
+    names = {
+        cls.__name__ for item in _exception_chain(error) for cls in type(item).__mro__
+    }
+    if isinstance(error, _NetworkNotFoundError) or "NetworkNotFoundError" in names:
+        return health_protocol.ERROR_NETWORK_NOT_FOUND
+    if names & {
+        "AuthenticationError",
+        "UnsupportedProtocolVersion",
+        "BridgeConfigurationError",
+    }:
+        return health_protocol.ERROR_CONFIGURATION
+    if isinstance(error, TimeoutError) or names & {"BluetoothError", "BleakError"}:
+        return (
+            health_protocol.ERROR_BLE_DISCOVERY_FAILED
+            if stage == health_protocol.PHASE_DISCOVERING
+            else health_protocol.ERROR_BLE_CONNECT_FAILED
+        )
+    return health_protocol.ERROR_UNKNOWN
+
+
+def startup_backoff(attempt: int, rng: Callable[[], float]) -> float:
+    """1, 2, 4, 8, 16 s, then capped at 30 s, each plus up to 20 % jitter."""
+    base = (
+        STARTUP_BACKOFF_SECONDS[attempt]
+        if attempt < len(STARTUP_BACKOFF_SECONDS)
+        else STARTUP_BACKOFF_CAP_SECONDS
+    )
+    base = min(base, STARTUP_BACKOFF_CAP_SECONDS)
+    return base * (1 + STARTUP_BACKOFF_JITTER * rng())
+
+
+async def run_bounded(awaitable: Awaitable[Any], deadline: float) -> Any:
+    """
+    Await ``awaitable`` for at most ``deadline`` plus a bounded unwind.
+
+    Unlike ``asyncio.timeout``/``wait_for``, this never waits for a cancelled
+    operation's own cleanup without limit: the operation runs in its own
+    task, and if it has not finished within BLE_CANCEL_GRACE after being
+    cancelled it is abandoned and ``_BleWedgedError`` is raised. A timeout
+    raises ``TimeoutError``. If the caller itself is cancelled the operation
+    is cancelled too, with the same bounded wait.
+    """
+    task = asyncio.ensure_future(awaitable)
+    try:
+        done, _pending = await asyncio.wait({task}, timeout=deadline)
+    except asyncio.CancelledError:
+        task.cancel()
+        await asyncio.wait({task}, timeout=BLE_CANCEL_GRACE)
+        raise
+    if task in done:
+        return task.result()
+    task.cancel()
+    done, _pending = await asyncio.wait({task}, timeout=BLE_CANCEL_GRACE)
+    if task not in done:
+        raise _BleWedgedError
+    with contextlib.suppress(asyncio.CancelledError, Exception):
+        task.result()
+    raise TimeoutError
+
+
+async def _bounded_cleanup(awaitable: Awaitable[Any]) -> None:
+    """Best-effort BLE cleanup; a wedged cleanup is re-raised, never ignored."""
+    try:
+        await run_bounded(awaitable, BLE_CLEANUP_TIMEOUT)
+    except _BleWedgedError:
+        raise
+    except Exception:  # noqa: BLE001, S110  # Cleanup failures change nothing.
+        pass
+
+
+async def run_startup_stage(  # noqa: PLR0913
+    stage: str,
+    operation: Callable[[], Awaitable[Any]],
+    health: BridgeHealth,
+    *,
+    deadline: float,
+    sleep: Any = asyncio.sleep,
+    cleanup: Callable[[], Awaitable[Any]] | None = None,
+    rng: Callable[[], float] | None = None,
+) -> Any:
+    """
+    Run one discovery or connect stage with a deadline and bounded retries.
+
+    Exactly one attempt runs at a time: a timed-out attempt is cancelled and
+    given a bounded time to unwind before ``cleanup`` releases its BLE state
+    and the next attempt starts. An attempt that ignores cancellation is
+    "wedged": the stage fails at once, and main() leaves the process (exit 76)
+    instead of staying alive and stuck. Configuration and unknown errors are
+    not retried -- only the fixed transient BLE categories are. After the
+    last attempt the stage fails with its category; it never loops forever.
+    """
+    category = health_protocol.ERROR_UNKNOWN
+    for attempt in range(STARTUP_ATTEMPTS):
+        health.set_phase(stage, category if attempt else health_protocol.ERROR_NONE)
+        try:
+            return await run_bounded(operation(), deadline)
+        except _BleWedgedError:
+            raise StartupFailedError(
+                classify_startup_error(TimeoutError(), stage), wedged=True
+            ) from None
+        except Exception as error:  # noqa: BLE001  # Classified, never logged.
+            category = classify_startup_error(error, stage)
+        if cleanup is not None:
+            try:
+                await _bounded_cleanup(cleanup())
+            except _BleWedgedError:
+                raise StartupFailedError(category, wedged=True) from None
+        health.set_phase(stage, category)
+        LOGGER.warning(
+            "Casambi %s attempt %d of %d failed: %s",
+            stage,
+            attempt + 1,
+            STARTUP_ATTEMPTS,
+            category,
+        )
+        if category not in _TRANSIENT_STARTUP_ERRORS:
+            break
+        if attempt + 1 < STARTUP_ATTEMPTS:
+            await sleep(startup_backoff(attempt, rng or random.random))
+    raise StartupFailedError(category)
+
+
 async def _run_bridge_until_stopped() -> None:
     """
     Run main() with SIGTERM mapped to a clean, cancelling shutdown.
@@ -1607,36 +1940,141 @@ async def _run_bridge_until_stopped() -> None:
                 loop.remove_signal_handler(signal.SIGTERM)
 
 
-async def main(  # noqa: PLR0915
+async def main(
     *,
     sleep: Any = asyncio.sleep,
     health: BridgeHealth | None = None,
 ) -> None:
+    health = health or BridgeHealth(record=_configured_health_record())
+    try:
+        await _main(health, sleep)
+    except CasambiDisconnected:
+        health.set_phase(
+            health_protocol.PHASE_OFFLINE, health_protocol.ERROR_BLE_DISCONNECTED
+        )
+        raise
+    except StartupFailedError as error:
+        health.set_phase(health_protocol.PHASE_OFFLINE, error.category)
+        await report_startup_failure(health)
+        if error.wedged:
+            LOGGER.error(  # noqa: TRY400  # Fixed category only, no traceback.
+                "Casambi BLE operation did not stop; exiting: %s", error.category
+            )
+            _hard_exit(EXIT_BLE_STARTUP_FAILED)
+        raise
+    except BridgeConfigurationError:
+        health.set_phase(
+            health_protocol.PHASE_OFFLINE, health_protocol.ERROR_CONFIGURATION
+        )
+        raise
+    except asyncio.CancelledError:
+        health.set_phase(health_protocol.PHASE_OFFLINE, health_protocol.ERROR_SHUTDOWN)
+        raise
+    except Exception:
+        health.set_phase(health_protocol.PHASE_OFFLINE, health_protocol.ERROR_UNKNOWN)
+        raise
+
+
+def _create_mqtt_client(health: BridgeHealth) -> aiomqtt.Client:
+    return aiomqtt.Client(
+        MQTT_BROKER,
+        port=MQTT_PORT,
+        username=MQTT_USERNAME,
+        password=MQTT_PASSWORD,
+        will=aiomqtt.Will(
+            health_protocol.status_topic(TOPIC_PREFIX, NETWORK_NAME),
+            payload=health.will_payload(),
+            qos=1,
+            retain=True,
+        ),
+    )
+
+
+async def report_startup_failure(health: BridgeHealth) -> None:
+    """
+    Publish the failed startup's status over a short, bounded MQTT session.
+
+    Discovery and connect happen before the bridge's normal MQTT session
+    exists, so without this a BLE startup failure loop (the 27.10.2026
+    ``org.bluez.Error.InProgress`` incident) would be invisible to Home
+    Assistant. Best effort: any MQTT problem is ignored, and the whole
+    attempt is bounded so it can never delay the exit by more than
+    STARTUP_REPORT_TIMEOUT.
+    """
+    try:
+        async with asyncio.timeout(STARTUP_REPORT_TIMEOUT):
+            async with _create_mqtt_client(health) as client:
+                health.mqtt = health_protocol.LINK_CONNECTED
+                await health.publish_status(client)
+    except Exception:  # noqa: BLE001  # Must never replace the planned exit code.
+        LOGGER.warning("Unable to report the failed startup over MQTT")
+    finally:
+        health.mqtt = health_protocol.LINK_DISCONNECTED
+
+
+def _configured_health_record() -> HealthRecord | None:
+    return HealthRecord(HEALTH_RECORD_PATH) if HEALTH_RECORD_PATH else None
+
+
+async def _discover_configured_device(health: BridgeHealth, sleep: Any) -> Any:
+    """
+    Discover the configured network with retries, or list networks if unset.
+
+    Returns None only in the interactive listing mode (no address set).
+    """
+
+    async def discover_once() -> Any:
+        devices = await discover()
+        if not NETWORK_ADDRESS:
+            return devices
+        device = configured_network_device(devices)
+        if device is None:
+            raise _NetworkNotFoundError
+        return device
+
+    found = await run_startup_stage(
+        health_protocol.PHASE_DISCOVERING,
+        discover_once,
+        health,
+        deadline=DISCOVERY_DEADLINE_SECONDS,
+        sleep=sleep,
+    )
+    if NETWORK_ADDRESS:
+        return found
+    LOGGER.info(
+        "No casambi network specified, "
+        "store the address of your network in CASAMBI_NETWORK_ADDRESS:"
+    )
+    for i, d in enumerate(found):
+        LOGGER.info("[%d]\t%s", i, d.address)
+    return None
+
+
+async def _main(health: BridgeHealth, sleep: Any) -> None:  # noqa: PLR0912, PLR0915
     if not is_valid_network_name(NETWORK_NAME):
         message = "CASAMBI_NETWORK_NAME must be one literal, non-empty MQTT topic level"
-        raise RuntimeError(message)
+        raise BridgeConfigurationError(message)
     heartbeat_seconds = health_heartbeat_seconds()
-    health = health or BridgeHealth()
-    health.set_phase(health_protocol.PHASE_DISCOVERING)
-    devices = await discover()
-    device: BLEDevice | None = configured_network_device(devices)
-
+    device = await _discover_configured_device(health, sleep)
     if device is None:
-        LOGGER.info(
-            "No casambi network specified, "
-            "store the address of your network in CASAMBI_NETWORK_ADDRESS:"
-        )
-        for i, d in enumerate(devices):
-            LOGGER.info("[%d]\t%s", i, d.address)
         sys.exit(0)
 
     casa = create_casambi_connection()
     disconnected = asyncio.Event()
     disconnect_registered = False
-    health.set_phase(health_protocol.PHASE_CONNECTING)
+    connected = False
+    stopping = False
     try:
-        await casa.connect(device, NETWORK_PASSWORD)
+        await run_startup_stage(
+            health_protocol.PHASE_CONNECTING,
+            lambda: casa.connect(device, NETWORK_PASSWORD),
+            health,
+            deadline=CONNECT_DEADLINE_SECONDS,
+            sleep=sleep,
+            cleanup=casa.disconnect,
+        )
         LOGGER.info("Connected to Casambi network")
+        connected = True
 
         loop = asyncio.get_running_loop()
 
@@ -1657,18 +2095,7 @@ async def main(  # noqa: PLR0915
         if disconnected.is_set():
             raise CasambiDisconnected
 
-        client = aiomqtt.Client(
-            MQTT_BROKER,
-            port=MQTT_PORT,
-            username=MQTT_USERNAME,
-            password=MQTT_PASSWORD,
-            will=aiomqtt.Will(
-                health_protocol.status_topic(TOPIC_PREFIX, NETWORK_NAME),
-                payload=health.will_payload(),
-                qos=1,
-                retain=True,
-            ),
-        )
+        client = _create_mqtt_client(health)
         interval = 5
 
         while True:
@@ -1693,6 +2120,7 @@ async def main(  # noqa: PLR0915
                 if disconnected.is_set():
                     raise CasambiDisconnected from None
                 health.mqtt = health_protocol.LINK_DISCONNECTED
+                health.mqtt_reconnects += 1
                 health.set_phase(
                     health_protocol.PHASE_DEGRADED, health_protocol.ERROR_MQTT
                 )
@@ -1702,16 +2130,29 @@ async def main(  # noqa: PLR0915
                 await sleep(interval)
             except asyncio.CancelledError:
                 LOGGER.info("Main task cancelled, waiting for cleanup")
+                stopping = True
                 break
 
+    except asyncio.CancelledError:
+        stopping = True
+        raise
     finally:
         if disconnect_registered:
             casa.unregisterDisconnectCallback(on_ble_disconnect)
         LOGGER.info("Shutting down..")
-        await casa.disconnect()
+        try:
+            await _bounded_cleanup(casa.disconnect())
+        except _BleWedgedError:
+            LOGGER.error("Casambi BLE disconnect did not stop; exiting")  # noqa: TRY400
+            # A requested stop is a clean exit (0); once connected this is a
+            # lost link (75). Only a failure before the first connect is a
+            # startup failure (76) that counts towards a Bluetooth reset.
+            if stopping:
+                _hard_exit(0)
+            _hard_exit(EXIT_BLE_DISCONNECTED if connected else EXIT_BLE_STARTUP_FAILED)
 
 
-def cli(argv: list[str] | None = None) -> int:
+def cli(argv: list[str] | None = None) -> int:  # noqa: PLR0911
     """Run the unchanged bridge, or the explicit sanitized switch probe."""
     args = sys.argv[1:] if argv is None else argv
     if args != ["switch-event-probe"]:
@@ -1720,6 +2161,16 @@ def cli(argv: list[str] | None = None) -> int:
             asyncio.run(_run_bridge_until_stopped())
         except CasambiDisconnected:
             return EXIT_BLE_DISCONNECTED
+        except StartupFailedError as error:
+            LOGGER.error("Casambi startup failed: %s", error.category)  # noqa: TRY400
+            if error.category == health_protocol.ERROR_CONFIGURATION:
+                return EXIT_CONFIGURATION
+            if error.category in BLE_STARTUP_FAILURES:
+                return EXIT_BLE_STARTUP_FAILED
+            return EXIT_STARTUP_FAILED_OTHER
+        except BridgeConfigurationError as error:
+            LOGGER.error("Invalid bridge configuration: %s", error)  # noqa: TRY400
+            return EXIT_CONFIGURATION
         return 0
 
     logging.disable(logging.CRITICAL)

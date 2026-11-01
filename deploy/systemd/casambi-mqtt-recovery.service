@@ -1,0 +1,27 @@
+# Root-owned, bounded recovery supervisor for the Casambi MQTT bridge.
+# Started by the bridge's OnFailure= and by casambi-mqtt-recovery.timer;
+# systemd never runs two instances of this oneshot at once, and the script
+# additionally holds an exclusive lock.
+[Unit]
+Description=Bounded recovery supervisor for the Casambi MQTT bridge
+
+[Service]
+Type=oneshot
+User=root
+# Installed root-owned outside the bridge checkout: root must never execute a
+# file the unprivileged bridge user can modify.
+ExecStart=/usr/bin/python3 -I /usr/local/libexec/casambi-mqtt/bridge_recovery.py run
+Environment=RECOVERY_BRIDGE_UNIT=casambi-mqtt.service
+Environment=RECOVERY_HEALTH_RECORD=/run/casambi-mqtt/health.json
+Environment=RECOVERY_STATE_DIR=/var/lib/casambi-mqtt-recovery
+# Budget: at most one Bluetooth reset per 10 minutes and two per 30 minutes.
+Environment=RECOVERY_MAX_RESETS_SHORT=1
+Environment=RECOVERY_SHORT_WINDOW_SECONDS=600
+Environment=RECOVERY_MAX_RESETS_LONG=2
+Environment=RECOVERY_LONG_WINDOW_SECONDS=1800
+StateDirectory=casambi-mqtt-recovery
+StateDirectoryMode=0700
+TimeoutStartSec=900
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectHome=read-only
