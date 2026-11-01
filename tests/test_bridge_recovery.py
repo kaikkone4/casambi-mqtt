@@ -408,7 +408,8 @@ def test_new_process_does_not_refill_the_budget(rec, settings):
     holder.clear()  # the new process now fails too
     manager.after_start = None
     assert ble_loop(rec, settings, manager, fake) == "budget_exhausted"
-    assert len(manager.calls) == 3  # no second reset inside 10 minutes
+    # No second reset inside 10 minutes; the bridge is stopped instead.
+    assert manager.calls[3:] == [("stop", BRIDGE)]
     state = rec.load_state(settings)
     assert state.recovery_failed
     assert state.reason == "budget_exhausted"
@@ -442,7 +443,7 @@ def test_forward_clock_jump_does_not_refill_the_budget(rec, settings):
     manager.after_start = None
     fake.wall_now += 7 * 24 * 3600  # NTP steps the wall clock forward a week
     assert ble_loop(rec, settings, manager, fake) == "budget_exhausted"
-    assert len(manager.calls) == 3
+    assert manager.calls[3:] == [("stop", BRIDGE)]
 
 
 def test_failure_mid_recovery_is_recovery_failed_and_restarts_bridge(rec, settings):
@@ -453,7 +454,8 @@ def test_failure_mid_recovery_is_recovery_failed_and_restarts_bridge(rec, settin
     assert manager.mutations == [
         ("stop", BRIDGE),
         ("restart", BT),
-        ("start", BRIDGE),  # cleanup: never left stopped
+        ("start", BRIDGE),  # cleanup: never left stopped by a failed step ...
+        ("stop", BRIDGE),  # ... but a terminal failure stops it on purpose
     ]
     state = rec.load_state(settings)
     assert state.recovery_failed
@@ -735,3 +737,74 @@ def test_exit_caused_by_the_recovery_stop_is_not_a_failure(rec, settings):
     fake.advance(60)
     run(rec, settings, manager, fake, reader)
     assert rec.load_state(settings).ble_failures == []
+
+
+# ---------------------------------------------------------------------------
+# Owner review of 80dc187: slow failure cycles and configuration precedence
+# ---------------------------------------------------------------------------
+
+
+def test_slow_failure_cycles_still_reach_the_threshold(rec, settings):
+    """A failing lifecycle of ~636 s (six 90 s connects, cleanup, backoff)."""
+    fake = FakeClock(rec)
+    manager = FakeManager(rec, settings, fake)
+    holder = {}
+    reader = ready_after_start(rec, manager, holder)
+    results = []
+    for _ in range(2):
+        manager.bridge_exits(76)
+        fake.advance(636)
+        results.append(run(rec, settings, manager, fake, reader))
+    assert results == ["no_repeated_ble_failure", "recovered"]
+
+
+def test_a_ready_bridge_ends_the_failure_streak(rec, settings):
+    fake = FakeClock(rec)
+    manager = FakeManager(rec, settings, fake)
+    manager.bridge_exits(76)
+    fake.advance(60)
+    run(rec, settings, manager, fake)
+    ready = lambda: record(rec, manager, NEW, phase="ready")  # noqa: E731
+    run(rec, settings, manager, fake, ready)
+    manager.bridge_exits(76)
+    fake.advance(60)
+    assert run(rec, settings, manager, fake) == "no_repeated_ble_failure"
+    assert manager.calls == []
+
+
+def test_current_configuration_error_beats_historical_ble_evidence(rec, settings):
+    fake = FakeClock(rec)
+    manager = FakeManager(rec, settings, fake)
+    manager.bridge_exits(76)
+    manager.bridge_exits(76)
+    manager.bridge_exits(78, restarted=False)
+    fake.advance(60)
+    assert run(rec, settings, manager, fake) == "configuration_error"
+    assert manager.calls == []
+
+
+def test_endless_plain_restarts_become_terminal(rec, settings):
+    fake = FakeClock(rec)
+    manager = FakeManager(rec, settings, fake)
+    results = []
+    for _ in range(rec.MAX_PLAIN_RESTART_STREAK + 1):
+        manager.bridge_exits(79, restarted=False)
+        fake.advance(rec.PLAIN_RESTART_WINDOW_SECONDS + 1)
+        results.append(run(rec, settings, manager, fake))
+    assert results == ["bridge_restarted"] * rec.MAX_PLAIN_RESTART_STREAK + [
+        "bridge_keeps_failing"
+    ]
+    assert manager.calls[-1] == ("stop", BRIDGE)
+    assert ("restart", BT) not in manager.calls
+    # Latched: nothing restarts it again until an operator reset.
+    fake.advance(7200)
+    run(rec, settings, manager, fake)
+    assert manager.calls[-1] == ("stop", BRIDGE)
+
+
+def test_unit_start_limit_covers_slow_cycles():
+    unit = (ROOT / "deploy/systemd/casambi-mqtt.service").read_text()
+    interval = int(unit.split("StartLimitIntervalSec=")[1].split()[0])
+    burst = int(unit.split("StartLimitBurst=")[1].split()[0])
+    slowest_cycle = 636  # seconds between exits of a slowly failing bridge
+    assert burst * slowest_cycle < interval

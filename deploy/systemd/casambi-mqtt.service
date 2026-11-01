@@ -5,12 +5,13 @@
 Description=Casambi MQTT bridge
 Wants=bluetooth.target network-online.target
 After=bluetooth.service network-online.target
-# systemd's own restarts stop after 5 failures in 10 minutes. The bridge
-# itself already retries discovery/connect with backoff (about 1 minute per
-# process), so this bounds a failure loop to minutes instead of hours. The
-# recovery supervisor (OnFailure= and its timer) then decides whether one
-# budgeted Bluetooth reset is justified.
-StartLimitIntervalSec=600
+# systemd's own restarts stop after 5 starts within an hour. One failing
+# process can take up to about 11 minutes (the bridge retries discovery and
+# connect with deadlines and backoff), so the window must be long enough to
+# catch slow failure cycles too, not only fast storms. The recovery
+# supervisor (OnFailure= and its timer) then decides whether one budgeted
+# Bluetooth reset or one plain restart is justified.
+StartLimitIntervalSec=3600
 StartLimitBurst=5
 OnFailure=casambi-mqtt-recovery.service
 

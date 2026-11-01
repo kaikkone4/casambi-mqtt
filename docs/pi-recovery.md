@@ -26,14 +26,15 @@ root cause.
    - An MQTT outage is retried inside the process. It never exits for it and never touches Bluetooth.
 2. **systemd** (`deploy/systemd/casambi-mqtt.service`):
    - `Restart=on-failure`, `RestartSec=10`, `RestartPreventExitStatus=78`.
-   - `StartLimitBurst=5` within `StartLimitIntervalSec=600`. The old 10 s window never limited anything. Now about five failing processes (roughly 5–6 minutes) put the unit in `failed` instead of looping for hours.
+   - `StartLimitBurst=5` within `StartLimitIntervalSec=3600`. The old 10 s window never limited anything. A failing process can take up to about 11 minutes, and a shorter window would never catch such slow cycles. Now five starts within an hour put the unit in `failed`, whether the failures come fast or slowly.
 3. **Root-owned supervisor** (`scripts/bridge_recovery.py`, run by
    `casambi-mqtt-recovery.service` from `OnFailure=` and a 1-minute timer):
    - It counts failures from what **systemd** reports for every single exit. The bridge unit's `ExecStopPost=+…bridge_recovery.py record-exit` runs as root after each exit, including every automatic restart and the final exit when systemd gives up. It receives systemd's own `$EXIT_CODE`/`$EXIT_STATUS` and appends them to a small root-owned exit log under its own brief lock. Each supervisor run consumes that log.
      - This is trusted data. Nothing is lost between timer runs, and nothing is counted twice.
      - `systemctl show` alone cannot provide this: systemd clears `ExecMainStatus` whenever it restarts the process.
    - A bridge process that is alive but has not progressed out of `discovering`/`connecting` for 10 minutes is treated as a repeated BLE fault by itself, because it has missed many retry cycles and will not exit on its own. With the bounded unwind above this should not happen; it is a second line of defence.
-   - It resets Bluetooth only after **two** BLE startup failures (exit 76) within 10 minutes, and only while the unit's current main process is not `ready`.
+   - It resets Bluetooth only after **two consecutive** BLE startup failures (exit 76), and only while the unit's current main process is not `ready`. Consecutive means no ready bridge was observed in between; seeing a ready bridge ends the streak. The evidence also expires after 2 hours, which spans the slowest failing lifecycle (about 11 minutes) many times over.
+   - A current configuration error (the unit has failed with exit 78) always wins: earlier BLE evidence never leads to a Bluetooth reset then.
    - The sequence is fixed:
      1. stop the bridge;
      2. wait (bounded) until its process is gone;
@@ -44,11 +45,18 @@ root cause.
    - Budget: at most **one reset per 10 minutes and two per 30 minutes**. It is charged before the first action and stored in root-owned state, so bridge restarts never refill it.
    - When the budget is spent, or any step fails, it latches `recovery_failed`, logs one `crit` line to the journal, and does nothing more.
    - The latch clears only after the supervisor **itself** has seen the unit's main process `ready` for an hour, measured from its own observations rather than any time the record claims, or by `bridge_recovery.py reset`.
-   - If systemd gave up on the bridge for another reason (not a configuration error, exit 78), it does one plain `reset-failed` and `start` per 30 minutes, without touching Bluetooth. This covers, for example, lights that were switched off at the wall for a while.
+   - If systemd gave up on the bridge for another reason (not a configuration error, exit 78), it does one plain `reset-failed` and `start` per 30 minutes, without touching Bluetooth. This covers, for example, lights that were switched off at the wall for a while. After three such restarts in a row without a ready bridge in between, it gives up (`bridge_keeps_failing`).
+   - **Giving up is terminal.** Whenever it latches `recovery_failed`, it also **stops the bridge unit**, because a latch alone would not stop systemd's own automatic restarts. The bridge stays stopped until an operator resets recovery and starts it again.
    - Budgets use the kernel's boot-scoped `CLOCK_BOOTTIME`, so an NTP clock step cannot refill them.
    - After a reset whose verification fails, the next reset is still held back by the 10-minute limit. In practice the supervisor then latches `recovery_failed` on the next repeated failure instead of trying again. This is deliberately conservative.
    - It never touches any other unit, never reboots, and never runs a shell.
    - MQTT errors, configuration errors, `network_not_found`, a BLE drop after the bridge had been ready, and Home Assistant consumer problems cause **zero** Bluetooth resets.
+
+**Operational limit:** the only privileged repair is restarting BlueZ
+(`bluetooth.service`). It does not reset the UART, controller firmware or
+kernel drivers. A controller that stays missing after a BlueZ restart cannot
+be recovered this way: recovery then ends in `recovery_failed` with the
+bridge stopped, which is the intended, visible outcome.
 
 A host **reboot is not implemented** as a recovery step. An opt-in reboot step
 would need its own approval and evidence that it works. Leave any existing
@@ -92,7 +100,7 @@ refuse to start (exit 78).
 | `RECOVERY_HEALTH_RECORD` | `/run/casambi-mqtt/health.json` | absolute path |
 | `RECOVERY_STATE_DIR` | `/var/lib/casambi-mqtt-recovery` | absolute path; set the same value in the bridge unit's `ExecStopPost=` line, or no exit is ever counted |
 | `RECOVERY_FAILURES_TO_RESET` | 2 | 2–10 |
-| `RECOVERY_FAILURE_WINDOW_SECONDS` | 600 | 60–86400 |
+| `RECOVERY_FAILURE_WINDOW_SECONDS` | 7200 | 1800–86400 |
 | `RECOVERY_MAX_RESETS_SHORT` / `_SHORT_WINDOW_SECONDS` | 1 / 600 | 1–5 / 300–86400 |
 | `RECOVERY_MAX_RESETS_LONG` / `_LONG_WINDOW_SECONDS` | 2 / 1800 | 1–10 / 600–604800 |
 | `RECOVERY_STOP_TIMEOUT_SECONDS` | 60 | 5–600 |
@@ -129,8 +137,9 @@ sudo systemctl restart casambi-mqtt.service
 
 Inspect: `journalctl -u casambi-mqtt -u casambi-mqtt-recovery`, and
 `sudo /usr/bin/python3 -I /usr/local/libexec/casambi-mqtt/bridge_recovery.py status`.
-After a `recovery_failed`, fix the cause, then acknowledge with
-`sudo env RECOVERY_STATE_DIR=/var/lib/casambi-mqtt-recovery /usr/bin/python3 -I /usr/local/libexec/casambi-mqtt/bridge_recovery.py reset`.
+After a `recovery_failed`, fix the cause, then acknowledge and start the
+bridge again:
+`sudo env RECOVERY_STATE_DIR=/var/lib/casambi-mqtt-recovery /usr/bin/python3 -I /usr/local/libexec/casambi-mqtt/bridge_recovery.py reset && sudo systemctl reset-failed casambi-mqtt.service && sudo systemctl start casambi-mqtt.service`.
 
 ## Rollback
 
