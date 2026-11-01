@@ -291,7 +291,7 @@ async def async_setup_entry(  # noqa: PLR0915
         if unit_kind != Unit.TYPE_LIGHT:
             # A valid unit this entry deliberately does not represent: the
             # consumer handled it, so it counts as processed.
-            health.on_processed_unit(msg.topic)
+            health.on_processed_unit(msg.topic, getattr(msg, "timestamp", None))
             return
 
         if unit.address:
@@ -323,7 +323,7 @@ async def async_setup_entry(  # noqa: PLR0915
             runtime_data.lights[msg.topic].update_entity(unit)
         # Only after the entity callback returned: an unchanged value counts,
         # a raised exception or an unready platform does not.
-        health.on_processed_unit(msg.topic)
+        health.on_processed_unit(msg.topic, getattr(msg, "timestamp", None))
 
     async def scene_processor(msg: ReceiveMessage) -> None:
         if not msg.payload or not msg.topic.startswith(scene_prefix):

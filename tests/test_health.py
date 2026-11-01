@@ -376,9 +376,9 @@ def test_consumer_probe_ok_on_unchanged_processed_state():
     clock = FakeClock()
     obs = healthy_observer(clock)
     probe = obs.start_probe(ProbeKind.CONSUMER)
-    for topic in (f"{EVENT_PREFIX}a", f"{EVENT_PREFIX}b"):
-        obs.on_raw_unit(topic, "same payload as before")
-        obs.on_processed_unit(topic)
+    for message_id, topic in enumerate((f"{EVENT_PREFIX}a", f"{EVENT_PREFIX}b")):
+        obs.on_raw_unit(topic, "same payload as before", message_id)
+        obs.on_processed_unit(topic, message_id)
     obs.on_reply(reply(probe.request_id, reply_type=hp.REPLY_SNAPSHOT, units=2))
     assert obs.last_result[ProbeKind.CONSUMER].outcome is ProbeOutcome.OK
 
@@ -418,9 +418,9 @@ def test_partly_rejected_units_are_partial_not_stale():
     clock = FakeClock()
     obs = healthy_observer(clock)
     probe = obs.start_probe(ProbeKind.CONSUMER)
-    for topic in ("a", "b", "c"):
-        obs.on_raw_unit(f"{EVENT_PREFIX}{topic}", "x")
-    obs.on_processed_unit(f"{EVENT_PREFIX}a")
+    for message_id, topic in enumerate(("a", "b", "c")):
+        obs.on_raw_unit(f"{EVENT_PREFIX}{topic}", "x", message_id)
+    obs.on_processed_unit(f"{EVENT_PREFIX}a", 0)
     obs.on_reply(reply(probe.request_id, reply_type=hp.REPLY_SNAPSHOT, units=3))
     clock.now += 21
     obs.tick()
@@ -754,10 +754,10 @@ def test_ambient_handling_cannot_certify_an_unprocessed_snapshot():
     obs = healthy_observer(clock)
     probe = obs.start_probe(ProbeKind.CONSUMER)
     # An ordinary ambient update of another unit is handled ...
-    obs.on_raw_unit(f"{EVENT_PREFIX}ambient", "x")
-    obs.on_processed_unit(f"{EVENT_PREFIX}ambient")
+    obs.on_raw_unit(f"{EVENT_PREFIX}ambient", "x", "amb")
+    obs.on_processed_unit(f"{EVENT_PREFIX}ambient", "amb")
     # ... but the snapshot's own unit only reaches the raw listener.
-    obs.on_raw_unit(f"{EVENT_PREFIX}snap", "x")
+    obs.on_raw_unit(f"{EVENT_PREFIX}snap", "x", "snap")
     obs.on_reply(snapshot_reply(probe, units=1))
     assert ProbeKind.CONSUMER not in obs.last_result
     clock.now += 21
@@ -782,29 +782,65 @@ def test_every_message_of_a_topic_must_be_handled():
     obs = healthy_observer(clock)
     probe = obs.start_probe(ProbeKind.CONSUMER)
     topic = f"{EVENT_PREFIX}a"
-    obs.on_raw_unit(topic, "ambient")
-    obs.on_processed_unit(topic)
-    obs.on_raw_unit(topic, "snapshot")  # the snapshot message is not handled
+    obs.on_raw_unit(topic, "ambient", "m1")
+    obs.on_processed_unit(topic, "m1")
+    obs.on_raw_unit(topic, "snapshot", "m2")  # not handled yet
     obs.on_reply(snapshot_reply(probe, units=1))
     assert ProbeKind.CONSUMER not in obs.last_result
-    obs.on_processed_unit(topic)
+    obs.on_processed_unit(topic, "m2")
     assert obs.last_result[ProbeKind.CONSUMER].outcome is ProbeOutcome.OK
+
+
+def test_later_same_topic_message_handled_first_cannot_cover_a_failed_one():
+    """
+    Owner review of eff3561: HA runs the consumer callback before the raw
+    listener. A snapshot message on X reaches raw but fails in the consumer;
+    a later ambient X is handled before its own raw callback runs. With
+    per-topic counts that briefly looked like full coverage and finished OK.
+    """
+    clock = FakeClock()
+    obs = healthy_observer(clock)
+    probe = obs.start_probe(ProbeKind.CONSUMER)
+    topic = f"{EVENT_PREFIX}x"
+    obs.on_raw_unit(topic, "snapshot", "snap")  # consumer failed on this one
+    obs.on_reply(snapshot_reply(probe, units=1))
+    obs.on_processed_unit(topic, "ambient")  # consumer first, as in HA
+    assert ProbeKind.CONSUMER not in obs.last_result
+    obs.on_raw_unit(topic, "ambient", "ambient")
+    assert ProbeKind.CONSUMER not in obs.last_result
+    clock.now += 21
+    obs.tick()
+    assert obs.last_result[ProbeKind.CONSUMER].outcome is ProbeOutcome.CONSUMER_PARTIAL
+    assert ProbeKind.CONSUMER not in obs.last_ok
+
+
+def test_messages_without_identity_never_certify_a_probe():
+    clock = FakeClock()
+    obs = healthy_observer(clock)
+    probe = obs.start_probe(ProbeKind.CONSUMER)
+    topic = f"{EVENT_PREFIX}x"
+    obs.on_raw_unit(topic, "x")
+    obs.on_processed_unit(topic)
+    obs.on_reply(snapshot_reply(probe, units=1))
+    clock.now += 21
+    obs.tick()
+    assert ProbeKind.CONSUMER not in obs.last_ok
 
 
 def test_new_bridge_instance_fences_pending_evidence():
     clock = FakeClock()
     obs = healthy_observer(clock)
     probe = obs.start_probe(ProbeKind.CONSUMER)
-    obs.on_raw_unit(f"{EVENT_PREFIX}x", "a")
-    obs.on_processed_unit(f"{EVENT_PREFIX}x")
+    obs.on_raw_unit(f"{EVENT_PREFIX}x", "a", "x1")
+    obs.on_processed_unit(f"{EVENT_PREFIX}x", "x1")
     obs.on_reply(snapshot_reply(probe, units=2))
     obs.on_status(
         status(INSTANCE_B, sequence=1, phase=hp.PHASE_STARTING).to_json(),
         retain=False,
     )
     assert obs.last_result[ProbeKind.CONSUMER].outcome is ProbeOutcome.SUPERSEDED
-    obs.on_raw_unit(f"{EVENT_PREFIX}y", "b")
-    obs.on_processed_unit(f"{EVENT_PREFIX}y")
+    obs.on_raw_unit(f"{EVENT_PREFIX}y", "b", "y1")
+    obs.on_processed_unit(f"{EVENT_PREFIX}y", "y1")
     assert ProbeKind.CONSUMER not in obs.last_ok
 
 
@@ -823,12 +859,12 @@ def _deadline_case(clock, *, callback_at, tick_first):
     probe = obs.start_probe(ProbeKind.CONSUMER)  # deadline = start + 20
     deadline = probe.deadline_at
     topic = f"{EVENT_PREFIX}a"
-    obs.on_raw_unit(topic, "x")
+    obs.on_raw_unit(topic, "x", "m1")
     obs.on_reply(snapshot_reply(probe, units=1))
     clock.now = deadline + (callback_at - 110)
     if tick_first:
         obs.tick()
-    obs.on_processed_unit(topic)
+    obs.on_processed_unit(topic, "m1")
     obs.tick()
     return obs.last_result[ProbeKind.CONSUMER].outcome
 
@@ -867,3 +903,45 @@ def test_reply_parser_rejects_non_string_enums_without_raising(key, bad):
 def test_status_parser_string_controls(value):
     parsed = hp.parse_status(json.dumps(status().as_dict() | {"phase": value}))
     assert (parsed is not None) == (value == "ready")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("expected_lingering_timers", [True])
+async def test_real_callback_order_cannot_turn_a_failed_snapshot_into_ok(
+    hass, mqtt_mock
+):
+    """
+    The entity consumer subscribes before the raw listener, so Home Assistant
+    runs it first for each message. The snapshot's message is not handled; a
+    later ambient message on the same topic is.
+    """
+    clock = FakeClock()
+    entry = await setup_entry(hass, clock)
+    obs = entry.runtime_data.health
+    async_fire_mqtt_message(hass, "casambi/test/status", status().to_json())
+    async_fire_mqtt_message(hass, f"{EVENT_PREFIX}addr", unit_payload("u1", "addr"))
+    await hass.async_block_till_done()
+    probe = obs.start_probe(ProbeKind.CONSUMER)
+    runtime = entry.runtime_data
+    add_entities = runtime.light_add_entities
+
+    # The snapshot's message: the real consumer runs but cannot handle it.
+    runtime.light_add_entities = None
+    async_fire_mqtt_message(hass, f"{EVENT_PREFIX}addr", unit_payload("u1", "addr"))
+    await hass.async_block_till_done()
+    runtime.light_add_entities = add_entities
+    async_fire_mqtt_message(
+        hass,
+        "casambi/test/health/reply",
+        reply(probe.request_id, reply_type=hp.REPLY_SNAPSHOT, units=1),
+    )
+    await hass.async_block_till_done()
+    # A later ambient update on the same topic: handled, consumer first.
+    async_fire_mqtt_message(hass, f"{EVENT_PREFIX}addr", unit_payload("u1", "addr"))
+    await hass.async_block_till_done()
+
+    assert ProbeKind.CONSUMER not in obs.last_ok
+    clock.now += 21
+    obs.tick()
+    assert obs.last_result[ProbeKind.CONSUMER].outcome is ProbeOutcome.CONSUMER_PARTIAL
+    assert await hass.config_entries.async_unload(entry.entry_id)
