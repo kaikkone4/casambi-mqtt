@@ -25,6 +25,8 @@ from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers import entity_registry as er
 from homeassistant.setup import async_setup_component
 
+from tests.helpers import get_device_by_identifier
+
 NETWORK = "koti"
 SWITCH_TOPIC = f"casambi/{NETWORK}/switch_events"
 UNIT_ID = 35
@@ -81,8 +83,10 @@ async def _publish(hass, subscriptions, button, event):
 
 
 def _switch_device(hass, entry):
-    return dr.async_get(hass).async_get_device(
-        identifiers={(DOMAIN, f"{entry.entry_id}:switch:{UNIT_ID}")}
+    return get_device_by_identifier(
+        dr.async_get(hass),
+        (DOMAIN, f"{entry.entry_id}:switch:{UNIT_ID}"),
+        entry.entry_id,
     )
 
 

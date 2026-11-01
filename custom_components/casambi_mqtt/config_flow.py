@@ -18,7 +18,7 @@ from .const import (
     configured_network_name,
     is_valid_network_name,
 )
-from .health import SETTING_RANGES, HealthSettings
+from .health import CONF_RECOVERY_ENABLED, SETTING_RANGES, HealthSettings
 
 
 def configured_network_names(
@@ -104,7 +104,7 @@ class CasambiMqttOptionsFlow(config_entries.OptionsFlow):
                 data.update(
                     {
                         key: user_input[key]
-                        for key in SETTING_RANGES
+                        for key in (*SETTING_RANGES, CONF_RECOVERY_ENABLED)
                         if key in user_input
                     }
                 )
@@ -121,6 +121,9 @@ class CasambiMqttOptionsFlow(config_entries.OptionsFlow):
             schema[vol.Required(key, default=current)] = vol.All(
                 vol.Coerce(int), vol.Range(min=minimum, max=maximum)
             )
+        schema[
+            vol.Required(CONF_RECOVERY_ENABLED, default=current_health.recovery_enabled)
+        ] = bool
         data_schema = vol.Schema(schema)
 
         return self.async_show_form(
