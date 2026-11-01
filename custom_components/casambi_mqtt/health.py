@@ -213,6 +213,20 @@ class BridgeStatusTracker:
         return BridgeState.STARTING
 
 
+MessageKey = tuple[str, object]
+
+
+def message_key(topic: str, identity: object | None) -> MessageKey:
+    """
+    Identify one MQTT message for correlation.
+
+    A message without an identity cannot be matched to anything: it gets a
+    unique key, so on the raw side it can never be "covered" and on the
+    consumer side it can never cover anything (fail closed).
+    """
+    return (topic, object() if identity is None else identity)
+
+
 @dataclass
 class PendingProbe:
     kind: ProbeKind
@@ -221,25 +235,35 @@ class PendingProbe:
     deadline_at: float
     instance_id: str | None = None
     reply: hp.HealthReply | None = None
-    # Messages per unit topic seen during the probe by the raw listener and
-    # by the real consumer. Only per-topic coverage of what actually arrived
-    # binds consumption to this snapshot; a bare count of handled topics
-    # could be satisfied by unrelated ambient updates.
-    raw_counts: dict[str, int] = field(default_factory=dict)
-    processed_counts: dict[str, int] = field(default_factory=dict)
+    # Unit messages seen during the probe, by message identity: the raw
+    # listener and the real consumer receive the very same MQTT message
+    # (topic plus its receipt timestamp). Matching identities -- not counts,
+    # which callback order can satisfy with a different message of the same
+    # topic -- binds consumption to the messages that actually arrived.
+    raw_messages: set[MessageKey] = field(default_factory=set)
+    processed_messages: set[MessageKey] = field(default_factory=set)
 
     @property
     def raw_topics(self) -> set[str]:
-        return set(self.raw_counts)
+        return {topic for topic, _ in self.raw_messages}
 
     @property
     def processed_topics(self) -> set[str]:
         """Window topics whose every received message the consumer handled."""
-        return {
+        unhandled = {
             topic
-            for topic, count in self.raw_counts.items()
-            if self.processed_counts.get(topic, 0) >= count
+            for topic, key in self.raw_messages
+            if (topic, key) not in self.processed_messages
         }
+        return self.raw_topics - unhandled
+
+    @property
+    def all_handled(self) -> bool:
+        return self.raw_messages <= self.processed_messages
+
+    @property
+    def any_handled(self) -> bool:
+        return bool(self.raw_messages & self.processed_messages)
 
 
 @dataclass(frozen=True, slots=True)
@@ -338,19 +362,23 @@ class ProbeTracker:
             return None
         return pending
 
-    def record_raw(self, topic: str, now: float) -> ProbeResult | None:
+    def record_raw(
+        self, topic: str, now: float, identity: object | None = None
+    ) -> ProbeResult | None:
         pending = self._collecting(now)
         if pending is None:
             return self.check(now)
-        pending.raw_counts[topic] = pending.raw_counts.get(topic, 0) + 1
-        return None
+        pending.raw_messages.add(message_key(topic, identity))
+        return self.check(now)
 
-    def record_processed(self, topic: str, now: float) -> ProbeResult | None:
+    def record_processed(
+        self, topic: str, now: float, identity: object | None = None
+    ) -> ProbeResult | None:
         pending = self._collecting(now)
         if pending is None:
             # After the deadline: expire first, never count late evidence.
             return self.check(now)
-        pending.processed_counts[topic] = pending.processed_counts.get(topic, 0) + 1
+        pending.processed_messages.add(message_key(topic, identity))
         return self.check(now)
 
     def supersede(self, now: float, instance_id: str | None) -> ProbeResult | None:
@@ -382,17 +410,17 @@ class ProbeTracker:
                 pending.kind is ProbeKind.CONSUMER
                 and reply is not None
                 and reply.units
-                and len(pending.raw_counts) >= reply.units
-                and len(pending.processed_topics) == len(pending.raw_counts)
+                and len(pending.raw_topics) >= reply.units
+                and pending.all_handled
             ):
                 return self._finish(ProbeOutcome.OK, now)
             return None
         if reply is None:
             return self._finish(ProbeOutcome.NO_REPLY, now)
         units = reply.units or 0
-        if len(pending.raw_counts) < units:
+        if len(pending.raw_topics) < units:
             return self._finish(ProbeOutcome.DELIVERY_INCOMPLETE, now)
-        if not any(pending.processed_counts.get(topic) for topic in pending.raw_counts):
+        if not pending.any_handled:
             # Everything reached Home Assistant and nothing was handled.
             return self._finish(ProbeOutcome.CONSUMER_STALE, now)
         # Some units were handled: the consumer runs, but a few payloads were
@@ -412,7 +440,7 @@ class ProbeTracker:
             outcome=outcome,
             finished_at=now,
             expected_units=None if reply is None else reply.units,
-            raw_units=len(pending.raw_counts),
+            raw_units=len(pending.raw_topics),
             processed_units=len(pending.processed_topics),
         )
 
@@ -492,21 +520,23 @@ class HealthObserver:
             )
         )
 
-    def on_raw_unit(self, topic: str, payload: str | bytes) -> None:
+    def on_raw_unit(
+        self, topic: str, payload: str | bytes, identity: object | None = None
+    ) -> None:
         if not payload or not is_unit_event_topic(topic, self.event_prefix):
             return
         self.consumer.raw_messages += 1
         now = self.now()
         self.consumer.last_raw_at = now
-        self._publish_result(self.probes.record_raw(topic, now))
+        self._publish_result(self.probes.record_raw(topic, now, identity))
 
-    def on_processed_unit(self, topic: str) -> None:
+    def on_processed_unit(self, topic: str, identity: object | None = None) -> None:
         if not is_unit_event_topic(topic, self.event_prefix):
             return
         now = self.now()
         self.consumer.processed_messages += 1
         self.consumer.last_processed_at = now
-        self._publish_result(self.probes.record_processed(topic, now))
+        self._publish_result(self.probes.record_processed(topic, now, identity))
 
     def tick(self) -> PendingProbe | None:
         """Expire probes and return a new probe to send, if one is due."""
