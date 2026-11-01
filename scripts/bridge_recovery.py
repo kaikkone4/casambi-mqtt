@@ -8,7 +8,8 @@ imports code the unprivileged bridge user can modify.
 
 What it does, and nothing else:
 
-* counts every bridge exit with the BLE startup exit status (76). systemd
+* counts trusted never-ready startup exits (76 and 79), and separately BLE
+  startup exits (76) as evidence for Bluetooth resets. systemd
   reports each exit to a root ``ExecStopPost=+`` hook (``record-exit``) in
   ``$EXIT_CODE``/``$EXIT_STATUS``; the hook appends it to a small root-owned
   exit log, and each supervisor run consumes that log into root-owned state
@@ -20,9 +21,11 @@ What it does, and nothing else:
   verify that a NEW bridge process reaches ``ready``;
 * when the bridge gave up for any other non-configuration reason: a
   separately budgeted plain restart of the bridge only;
-* after the budget is spent, or when any step fails: latch
-  ``recovery_failed``, log one critical line, and do nothing further until a
-  long healthy period it observed itself, or an operator ``reset``.
+* after a budget is spent, or when any recovery step fails: latch
+  ``recovery_failed`` and persist a terminal stop request. Retry failed stops
+  until verified; no further recovery attempts. After a completed stop, a
+  manually started bridge can clear the latch through a long observed healthy
+  period; an operator ``reset`` also clears it.
 
 It never touches any unit other than the configured bridge unit and
 ``bluetooth.service``, never runs a shell, never reboots, and never reacts to
@@ -62,8 +65,12 @@ MAX_RECORD_BYTES = 4096
 MAX_SEEN_INSTANCES = 32
 EXIT_BLE_STARTUP_FAILED = 76
 EXIT_CONFIGURATION = 78
+EXIT_STARTUP_FAILED = 79
+# Independent of rate windows and systemd's start limiter: six trusted
+# startup exits without observing the current process ready are terminal.
+MAX_STARTUP_FAILURE_STREAK = 6
 # A live bridge whose record has not changed for this long while it is still
-# discovering/connecting is stuck (it should have exited within ~3 minutes).
+# discovering/connecting is stuck (legitimate retry progress updates it).
 STUCK_SECONDS = 600
 PLAIN_RESTART_WINDOW_SECONDS = 1800
 MAX_PLAIN_RESTARTS_PER_WINDOW = 1
@@ -104,9 +111,7 @@ LINKS = frozenset({"connected", "disconnected", "unknown"})
 # Every validated setting maps to its default, minimum and maximum.
 SETTING_RANGES: dict[str, tuple[int, int, int]] = {
     "RECOVERY_FAILURES_TO_RESET": (2, 2, 10),
-    # Long enough to span the slowest legitimate failing lifecycle (about 11
-    # minutes: six 90 s connect attempts with cleanup and backoff) many times
-    # over; the streak also ends as soon as a ready bridge is observed.
+    # BLE evidence window only; the cumulative startup streak does not expire.
     "RECOVERY_FAILURE_WINDOW_SECONDS": (7200, 1800, 86400),
     "RECOVERY_MAX_RESETS_SHORT": (1, 1, 5),
     "RECOVERY_SHORT_WINDOW_SECONDS": (600, 300, 86400),
@@ -416,11 +421,13 @@ class State:
     resets: list[dict[str, Any]] = field(default_factory=list)
     plain_restarts: list[dict[str, Any]] = field(default_factory=list)
     plain_restart_streak: int = 0
+    startup_failure_streak: int = 0
     ready_instance: str = ""
     ready_since: dict[str, Any] | None = None
     stuck_counted: list[str] = field(default_factory=list)
     mqtt_reconnects: int = 0
     recovery_failed: bool = False
+    terminal_stop_pending: bool = False
     reason: str = "none"
     last_result: str = "none"
 
@@ -454,7 +461,9 @@ def parse_state(raw: str) -> State:
         )
         or not _is_int(data.get("mqtt_reconnects"))
         or not _is_int(data.get("plain_restart_streak", 0))
+        or not _is_int(data.get("startup_failure_streak", 0))
         or not isinstance(data.get("recovery_failed"), bool)
+        or not isinstance(data.get("terminal_stop_pending", False), bool)
         or not isinstance(data.get("reason"), str)
         or not isinstance(data.get("last_result"), str)
     ):
@@ -466,7 +475,9 @@ def parse_state(raw: str) -> State:
         stuck_counted=stuck[-MAX_SEEN_INSTANCES:],
         mqtt_reconnects=data["mqtt_reconnects"],
         plain_restart_streak=data.get("plain_restart_streak", 0),
+        startup_failure_streak=data.get("startup_failure_streak", 0),
         recovery_failed=data["recovery_failed"],
+        terminal_stop_pending=data.get("terminal_stop_pending", False),
         reason=data["reason"][:64],
         last_result=data["last_result"][:64],
     )
@@ -519,6 +530,7 @@ ACTION_NONE = "none"
 ACTION_RECOVER = "recover"
 ACTION_RESTART = "restart_bridge"
 ACTION_LATCH = "latch_failed"
+ACTION_STOP = "stop_bridge"
 
 
 @dataclass(frozen=True)
@@ -620,6 +632,11 @@ def observe(  # noqa: PLR0913
 ) -> None:
     """Fold one observation of systemd, its exit log and the record."""
     for item in exits or []:
+        if item["code"] == "exited" and item["status"] in {
+            str(EXIT_BLE_STARTUP_FAILED),
+            str(EXIT_STARTUP_FAILED),
+        }:
+            state.startup_failure_streak += 1
         if item["code"] == "exited" and item["status"] == str(EXIT_BLE_STARTUP_FAILED):
             state.ble_failures.append(item["stamp"])
     state.ble_failures = _recent(state.ble_failures, clock, s.failure_window)
@@ -639,12 +656,15 @@ def observe(  # noqa: PLR0913
         # later failures start a new streak.
         state.ble_failures = []
         state.plain_restart_streak = 0
+        state.startup_failure_streak = 0
         if state.ready_instance != record.instance_id or state.ready_since is None:
             # The healthy period starts when THIS supervisor first sees it,
             # never at a time the (untrusted) record claims.
             state.ready_instance = record.instance_id
             state.ready_since = clock.stamp()
-        elif not is_recent(state.ready_since, clock, s.healthy_reset_seconds):
+        elif not state.terminal_stop_pending and not is_recent(
+            state.ready_since, clock, s.healthy_reset_seconds
+        ):
             if state.recovery_failed:
                 log(5, "Bridge observed healthy for a long period; latch cleared")
             state.recovery_failed = False
@@ -673,6 +693,16 @@ def decide(  # noqa: PLR0911
     s: Settings,
 ) -> Decision:
     if state.recovery_failed:
+        trusted = trusted_record(record, unit)
+        if (
+            state.terminal_stop_pending
+            and not (
+                unit.active_state == "failed"
+                and unit.exec_main_status == EXIT_CONFIGURATION
+            )
+            and not (trusted is not None and trusted.phase == "ready")
+        ):
+            return Decision(ACTION_STOP, "recovery_failed")
         return Decision(ACTION_NONE, "recovery_failed")
     if unit.active_state == "failed" and unit.exec_main_status == EXIT_CONFIGURATION:
         # The current, authoritative state is a configuration error: no
@@ -681,6 +711,8 @@ def decide(  # noqa: PLR0911
     trusted = trusted_record(record, unit)
     if trusted is not None and trusted.phase == "ready":
         return Decision(ACTION_NONE, "bridge_ready")
+    if state.startup_failure_streak >= MAX_STARTUP_FAILURE_STREAK:
+        return Decision(ACTION_LATCH, "startup_failure_budget_exhausted")
     if len(state.ble_failures) >= s.failures_to_reset:
         if (
             len(_recent(state.resets, clock, s.short_window)) >= s.max_resets_short
@@ -830,6 +862,7 @@ def recover(  # noqa: PLR0913
 
     def fail(reason: str) -> bool:
         state.recovery_failed = True
+        state.terminal_stop_pending = True
         state.reason = reason
         state.last_result = "recovery_failed"
         persist(state)
@@ -892,6 +925,7 @@ def recover(  # noqa: PLR0913
         log(3, "Casambi bridge did not report ready after the Bluetooth reset")
         return False
     state.ble_failures = []
+    state.startup_failure_streak = 0
     state.last_result = "recovered"
     persist(state)
     log(5, "Casambi bridge recovered after a Bluetooth reset")
@@ -915,9 +949,11 @@ def restart_bridge(
     log(5, "Casambi bridge restarted after systemd gave up (no Bluetooth reset)")
 
 
-def stop_terminally(manager: Systemctl, settings: Settings) -> None:
+def stop_terminally(
+    manager: Systemctl, settings: Settings, state: State, clock: Clock
+) -> None:
     """
-    Stop the bridge once recovery has given up, until an operator reset.
+    Retry a persisted terminal stop until systemd confirms it completed.
 
     A latch alone would not stop systemd's own automatic restarts, so a
     slowly failing bridge would otherwise keep cycling forever.
@@ -927,7 +963,17 @@ def stop_terminally(manager: Systemctl, settings: Settings) -> None:
     except ServiceManagerError:
         log(3, "Unable to stop the bridge after recovery gave up")
         return
-    log(2, "Casambi bridge stopped until an operator resets recovery")
+    if not _wait_until(
+        lambda: _fully_stopped(manager, settings.bridge_unit),
+        settings.stop_timeout,
+        clock,
+        settings.poll_interval,
+    ):
+        log(3, "Bridge terminal stop not yet verified; will retry")
+        return
+    state.terminal_stop_pending = False
+    save_state(settings, state)
+    log(2, "Casambi bridge terminal stop verified; recovery remains latched")
 
 
 def run_once(
@@ -954,11 +1000,12 @@ def run_once(
         decision = decide(state, unit, record, clock, settings)
         if decision.action == ACTION_LATCH:
             state.recovery_failed = True
+            state.terminal_stop_pending = True
             state.reason = decision.reason
             state.last_result = "recovery_failed"
             save_state(settings, state)
             log(2, f"Casambi bridge recovery failed: {decision.reason}; no reset")
-            stop_terminally(manager, settings)
+            stop_terminally(manager, settings, state, clock)
             return decision.reason
         if decision.action == ACTION_RESTART:
             restart_bridge(manager, settings, state, clock)
@@ -966,6 +1013,8 @@ def run_once(
             return state.last_result
         save_state(settings, state)
         if decision.action != ACTION_RECOVER:
+            if decision.action == ACTION_STOP:
+                stop_terminally(manager, settings, state, clock)
             return decision.reason
         recover(
             manager,
@@ -977,7 +1026,7 @@ def run_once(
             lambda current: save_state(settings, current),
         )
         if state.recovery_failed:
-            stop_terminally(manager, settings)
+            stop_terminally(manager, settings, state, clock)
         return state.last_result
 
 

@@ -302,6 +302,7 @@ def test_repeated_ble_exits_do_exactly_stop_restart_start(rec, settings):
     assert manager.mutations == [("stop", BRIDGE), ("restart", BT), ("start", BRIDGE)]
     state = rec.load_state(settings)
     assert state.ble_failures == []
+    assert state.startup_failure_streak == 0
     assert len(state.resets) == 1
 
 
@@ -356,7 +357,7 @@ def test_non_ble_exits_never_reset_bluetooth(rec, settings, status):
         manager.bridge_exits(status)
         fake.advance(70)
         run(rec, settings, manager, fake)
-    assert manager.calls == []
+    assert manager.calls == ([("stop", BRIDGE)] if status == 79 else [])
 
 
 def test_mqtt_outage_and_ha_consumer_fault_never_reset(rec, settings):
@@ -808,3 +809,208 @@ def test_unit_start_limit_covers_slow_cycles():
     burst = int(unit.split("StartLimitBurst=")[1].split()[0])
     slowest_cycle = 636  # seconds between exits of a slowly failing bridge
     assert burst * slowest_cycle < interval
+
+
+@pytest.mark.parametrize("status,spacing", [(79, 943), (79, 86401), (76, 86401)])
+def test_never_ready_startup_budget_survives_reload_expiry_and_boot(
+    rec, settings, status, spacing
+):
+    # Permitted composed lifecycle: discovery 255 + connect 669 + cleanup 9
+    # = 933 seconds; RestartSec=10 gives 943 seconds between starts.
+    fake = FakeClock(rec)
+    manager = FakeManager(rec, settings, fake)
+    result = None
+    for cycle in range(6):
+        fake.advance(spacing)
+        if cycle == 3:
+            fake.boot = "99999999-2222-3333-4444-555555555555"
+            fake.mono_now = 100.0
+        manager.bridge_exits(status)
+        result = run(rec, settings, manager, fake)
+        if cycle < 5:
+            assert not rec.load_state(settings).recovery_failed
+    assert result == "startup_failure_budget_exhausted"
+    assert rec.load_state(settings).recovery_failed
+    assert manager.active == "inactive"
+    assert rec.load_state(settings).plain_restart_streak == 0
+    if status == 79:
+        assert manager.calls == [("stop", BRIDGE)]
+
+
+@pytest.mark.parametrize("failure", ["stop", "unverified"])
+def test_terminal_stop_pending_is_durable_until_verified(rec, settings, failure):
+    fake = FakeClock(rec)
+    manager = FakeManager(rec, settings, fake,
+                          fail_verb="stop" if failure == "stop" else None,
+                          stop_hangs=failure == "unverified")
+    rec.save_state(settings, rec.State(plain_restart_streak=3))
+    manager.bridge_exits(1, restarted=False)
+    # Make the failed unit still have a process, so verification matters.
+    manager.main_pid = 100
+    assert run(rec, settings, manager, fake) == "bridge_keeps_failing"
+    assert json.loads(rec.load_state(settings).to_json()).get("terminal_stop_pending") is True
+    assert manager.main_pid == 100
+    for _ in range(2):
+        run(rec, settings, manager, fake)
+        assert json.loads(rec.load_state(settings).to_json()).get("terminal_stop_pending") is True
+    manager.fail_verb = None
+    manager.stop_hangs = False
+    run(rec, settings, manager, fake)
+    assert rec.load_state(settings).terminal_stop_pending is False
+    assert manager.active == "inactive"
+    assert manager.calls == [("stop", BRIDGE)] * 4
+    # A completed stop must not kill a later manual start, even before ready.
+    manager.action("start", BRIDGE, 60)
+    calls = list(manager.calls)
+    run(rec, settings, manager, fake)
+    assert manager.calls == calls
+    ready = lambda: record(rec, manager, NEW, phase="ready")
+    run(rec, settings, manager, fake, ready)
+    fake.advance(settings.healthy_reset_seconds + 1)
+    run(rec, settings, manager, fake, ready)
+    assert not rec.load_state(settings).recovery_failed
+
+
+def test_terminal_stop_is_persisted_before_service_action(rec, settings):
+    fake = FakeClock(rec)
+    manager = FakeManager(rec, settings, fake)
+    rec.save_state(settings, rec.State(plain_restart_streak=3))
+    manager.bridge_exits(1, restarted=False)
+    action = manager.action
+
+    def checked_action(verb, unit, timeout):
+        assert json.loads(rec.load_state(settings).to_json()).get("terminal_stop_pending") is True
+        action(verb, unit, timeout)
+
+    manager.action = checked_action
+    run(rec, settings, manager, fake)
+    assert rec.load_state(settings).terminal_stop_pending is False
+
+
+@pytest.mark.parametrize("guard", ["ready", "configuration"])
+def test_pending_stop_preserves_current_ready_and_configuration_guards(
+    rec, settings, guard
+):
+    fake = FakeClock(rec)
+    manager = FakeManager(rec, settings, fake)
+    state = rec.State(recovery_failed=True, terminal_stop_pending=True,
+                      startup_failure_streak=6)
+    rec.save_state(settings, state)
+    reader = lambda: record(rec, manager, NEW, phase="ready")
+    if guard == "configuration":
+        manager.bridge_exits(78, restarted=False)
+        reader = lambda: None
+    run(rec, settings, manager, fake, reader)
+    fake.advance(settings.healthy_reset_seconds + 1)
+    run(rec, settings, manager, fake, reader)
+    assert manager.calls == []
+    assert rec.load_state(settings).terminal_stop_pending
+    assert rec.load_state(settings).recovery_failed
+
+
+def test_startup_streak_only_clears_for_current_ready_or_operator_reset(
+    rec, settings, monkeypatch
+):
+    fake = FakeClock(rec)
+    manager = FakeManager(rec, settings, fake)
+    for status in (76, 79):
+        manager.bridge_exits(status)
+    run(rec, settings, manager, fake)
+    assert rec.load_state(settings).startup_failure_streak == 2
+    run(rec, settings, manager, fake)  # Consumed exits cannot count twice.
+    for status in (75, 78):
+        manager.bridge_exits(status)
+        stale = lambda: record(rec, manager, NEW, phase="ready", pid=4242)
+        run(rec, settings, manager, fake, stale)
+        assert rec.load_state(settings).startup_failure_streak == 2
+    ready = lambda: record(rec, manager, NEW, phase="ready")
+    run(rec, settings, manager, fake, ready)
+    assert rec.load_state(settings).startup_failure_streak == 0
+    rec.save_state(settings, rec.State(startup_failure_streak=5,
+                                     recovery_failed=True, terminal_stop_pending=True))
+    monkeypatch.setenv("RECOVERY_STATE_DIR", str(settings.state_dir))
+    assert rec.main(["reset"]) == 0
+    state = rec.load_state(settings)
+    assert state.startup_failure_streak == 0
+    assert not state.terminal_stop_pending
+
+
+def test_state_v1_defaults_new_fields_without_reinterpreting_old_latches(rec):
+    data = json.loads(rec.State(recovery_failed=True).to_json())
+    del data["startup_failure_streak"]
+    del data["terminal_stop_pending"]
+    state = rec.parse_state(json.dumps(data))
+    assert state.recovery_failed
+    assert state.startup_failure_streak == 0
+    assert state.terminal_stop_pending is False
+    assert state.reason == "none"
+
+
+@pytest.mark.parametrize("field,value", [
+    ("startup_failure_streak", True), ("startup_failure_streak", -1),
+    ("startup_failure_streak", 1.5), ("startup_failure_streak", "6"),
+    ("terminal_stop_pending", 1), ("terminal_stop_pending", "true"),
+    ("terminal_stop_pending", None),
+])
+def test_invalid_new_state_fields_fail_closed(rec, field, value):
+    data = json.loads(rec.State().to_json())
+    data[field] = value
+    state = rec.parse_state(json.dumps(data))
+    assert state.recovery_failed
+    assert state.reason == "state_unreadable"
+
+
+@pytest.mark.parametrize("origin", ["startup", "ble_budget", "recover", "verify", "plain_failed"])
+def test_all_terminal_latch_paths_persist_stop_intent(rec, settings, origin):
+    fake = FakeClock(rec)
+    manager = FakeManager(rec, settings, fake, fail_verb="stop")
+    state = rec.State()
+    if origin == "startup":
+        state.startup_failure_streak = 6
+    elif origin in {"ble_budget", "recover", "verify"}:
+        state.ble_failures = [fake.clock.stamp()] * 2
+        if origin == "ble_budget":
+            state.resets = [fake.clock.stamp()] * 2
+        elif origin == "verify":
+            state.resets = [fake.clock.stamp()]
+            fake.advance(settings.short_window + 1)
+            manager.fail_verb = None
+    else:
+        state.plain_restart_streak = 2
+        rec.save_state(settings, state)
+        manager.bridge_exits(1, restarted=False)
+        manager.fail_verb = "start"
+        assert run(rec, settings, manager, fake) == "bridge_restart_failed"
+        state = rec.load_state(settings)
+        manager.fail_verb = "stop"
+    rec.save_state(settings, state)
+    action = manager.action
+
+    def checked_action(verb, unit, timeout):
+        if verb == "stop" and rec.load_state(settings).recovery_failed:
+            assert rec.load_state(settings).terminal_stop_pending
+        action(verb, unit, timeout)
+
+    manager.action = checked_action
+    run(rec, settings, manager, fake)
+    assert rec.load_state(settings).recovery_failed
+    if origin != "verify":
+        assert rec.load_state(settings).terminal_stop_pending
+        manager.fail_verb = None
+        run(rec, settings, manager, fake)
+    assert rec.load_state(settings).terminal_stop_pending is False
+    assert manager.active == "inactive"
+
+
+@pytest.mark.parametrize("guard", ["ready", "configuration"])
+def test_current_guard_beats_exhausted_startup_budget(rec, settings, guard):
+    fake = FakeClock(rec)
+    manager = FakeManager(rec, settings, fake)
+    rec.save_state(settings, rec.State(startup_failure_streak=6))
+    reader = lambda: record(rec, manager, NEW, phase="ready")
+    if guard == "configuration":
+        manager.bridge_exits(78, restarted=False)
+        reader = lambda: None
+    run(rec, settings, manager, fake, reader)
+    assert manager.calls == []
+    assert not rec.load_state(settings).recovery_failed
