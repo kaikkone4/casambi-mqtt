@@ -6,13 +6,15 @@ A local-push Home Assistant integration for Casambi networks. A separate Bluetoo
 
 ## Release notes
 
-### Unreleased
+### 0.2.10
 
 - Adds the versioned, non-actuating bridge health protocol v1 (`casambi/<network>/status`, `casambi/<network>/health/reply`, `GET_STATUS`, and a correlated `PUBLISH_ENTITIES` snapshot). See [docs/health-protocol.md](docs/health-protocol.md) for topics, minimum ACLs, what it does and does not prove, and rollback.
 - The Home Assistant component observes bridge freshness and whether its own unit consumer still handles messages. A diagnostic **Casambi health** sensor shows the entry's state, and the entry reloads only itself when its updates are proven stuck. See **Consumer health and automatic recovery** below.
 - Fixes an error raised on every state update of a user-disabled Casambi light or scene entity.
+- Correlates consumer health evidence per MQTT receipt, refreshes diagnostic attributes even when the verdict is unchanged, and verifies the component on Home Assistant Core 2026.8.2 and 2026.10.4.
 - The bridge bounds BLE discovery/connect with deadlines and backoff, classifies BlueZ failures by their D-Bus error name, reports a failed startup over MQTT, and exits with distinct codes (75 BLE lost, 76 BLE startup failed, 78 configuration, 79 other startup failure). A root-owned, budgeted supervisor and systemd units for the bridge host are in `deploy/systemd/`; see [docs/pi-recovery.md](docs/pi-recovery.md).
 - The bridge maps SIGTERM to a clean shutdown and registers a retained `offline` last will. Existing topics, payloads, commands and entity identities are unchanged.
+- A persistent never-ready startup budget and verified terminal-stop retries bound slow failure loops. Automatic recovery does not reboot the host or repair UART/controller firmware; see the operational limits in the recovery guide.
 
 ### 0.2.9
 
