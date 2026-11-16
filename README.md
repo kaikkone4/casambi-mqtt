@@ -1,8 +1,22 @@
 # Casambi MQTT for Home Assistant
 
+**Maintained fork:** [`kaikkone4/casambi-mqtt`](https://github.com/kaikkone4/casambi-mqtt), based on [`peterklijn/casambi-mqtt`](https://github.com/peterklijn/casambi-mqtt). This is not the original author's release channel. Thanks to the upstream project and [casambi-bt](https://github.com/lkempf/casambi-bt) contributors.
+
 A local-push Home Assistant integration for Casambi networks. A separate Bluetooth bridge publishes Casambi unit and scene state to MQTT; Home Assistant consumes those topics and sends control commands back through MQTT. This lets the Bluetooth bridge run on a different Linux host from Home Assistant.
 
 > This project uses the unofficial [casambi-bt](https://github.com/lkempf/casambi-bt) library. It currently supports dimmable lights and scenes.
+
+## What this fork adds
+
+- Sanitized physical switch events, HA device triggers and read-only button event entities.
+- Stable UUID-based identities for addressless units, with scoped entity migration.
+- Bounded bridge startup/shutdown, BLE-disconnect handling and privacy-safe MQTT publication.
+- A versioned non-actuating health protocol and independent, bounded HA consumer recovery.
+- Two deployment profiles using the same maintained bridge: dedicated Linux/systemd or a shared-host HAOS app. The HAOS controller has a durable three-replacement limit and a scoped HA notification, without host/Core reboots or global BlueZ resets.
+
+The HA integration and HAOS app have separate versions: integration release `v0.2.10` and app `0.2.10-haos.2`. Installing/updating one does not install/update the other. Keep the existing MQTT namespace and config entry when upgrading; do not recreate working entities.
+
+Start with [deployment modes](docs/deployment-modes.md), then choose [HACS integration installation](#install-the-home-assistant-integration-with-hacs) and either the [HAOS app](#install-the-haos-bridge-app) or [standalone bridge](#install-the-bluetooth-bridge-from-source).
 
 ## Release notes
 
@@ -76,6 +90,14 @@ Both profiles use the same maintained bridge and MQTT/entity identities. Run onl
 
 This repository is currently distributed as a **HACS custom repository**.
 
+### Important: choose one HACS update source
+
+The original repository and this fork both use domain `casambi_mqtt` and directory `custom_components/casambi_mqtt`. Different GitHub names do **not** make them side-by-side installations. If HACS marks both as installed, an update from either can overwrite the same files. Their independent version numbers are not a safe upgrade ordering.
+
+For this fork, use **only `kaikkone4/casambi-mqtt` as the installed update source**. Before switching from upstream, back up the current component/config/HACS metadata. Preserve the existing Casambi MQTT config entry and entity IDs. Do not click **Uninstall** on an obsolete duplicate while it shares the active directory: that can delete the working fork too. Remove the obsolete HACS registration without deleting component files, using a method verified for your installed HACS version; if unsure, ask before proceeding. Disabling automatic updates alone does not stop a manual download from the wrong source.
+
+### New installation
+
 1. In Home Assistant, open **HACS → Integrations**.
 2. Open the three-dot menu → **Custom repositories**.
 3. Add `https://github.com/kaikkone4/casambi-mqtt` with category **Integration**.
@@ -85,6 +107,17 @@ This repository is currently distributed as a **HACS custom repository**.
 7. Enter the MQTT network name used by the bridge. It must be one literal MQTT topic level (no `/`, `+`, or `#`).
 
 For upgrades that include an entity migration, keep the existing config entry and restart Home Assistant. Do not delete and recreate the integration: the migration preserves existing entity IDs and user customizations where safely possible.
+
+## Install the HAOS bridge app
+
+1. Add `https://github.com/kaikkone4/casambi-mqtt` in the Home Assistant app store's repository settings. Use the canonical URL, not a temporary `#feature-branch` URL.
+2. Install **Casambi MQTT Bridge (experimental)** on a supported `aarch64` host. The app builds locally; no container-registry login is needed.
+3. Follow the [private configuration and preflight instructions](haos_casambi/DOCS.md). The default mode is disabled; selecting bridge mode enables normal MQTT control, not a read-only test.
+4. Install the [scoped recovery-notification automation](haos_casambi/recovery-notification.yaml), substituting the existing network namespace. See the app guide for explicit rearm and broker-outage limits.
+
+Leave deliberately disabled HA-native Bluetooth entries and existing ESPHome proxies unchanged. Run only one bridge for the network. The app's internal watchdog checks controller liveness, not physical RF or full HA readiness.
+
+**Existing feature-branch installations:** do not remove the old repository/app or add a second active bridge blindly. Supervisor includes the repository URL/branch in its identity, so a canonical URL can produce a different app ID and separate data directory. Preserve private settings, trusted cache and recovery state in an app backup; plan and verify the source migration before deleting anything. A GitHub merge alone does not migrate an installed app.
 
 ## Install the Bluetooth bridge from source
 
@@ -128,8 +161,11 @@ raw callback payload, or credentials in this message. Identical sanitized
 `(unit_id, button, event)` callback bursts within 250 ms are collapsed using a
 monotonic clock. A `PRESS` and `RELEASE` are distinct tuples, so the real
 press/release sequence is preserved. The handler is unregistered whenever the
-MQTT session reconnects or the bridge shuts down. This topic does not control a
-device and does not create or trigger a Home Assistant entity, scene, or action.
+MQTT session reconnects or the bridge shuts down. The bridge only publishes
+input events; it never actuates a Casambi unit in response to them. The Home
+Assistant integration consumes this topic to expose read-only button event
+entities and device triggers. User-authored HA automations decide what actions,
+if any, a physical button should perform.
 
 ### Button mapping in Home Assistant
 
