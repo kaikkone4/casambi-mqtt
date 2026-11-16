@@ -1,0 +1,40 @@
+id: casambi_haos_recovery_NETWORK_NAME
+alias: Casambi – palautus pysäytetty (NETWORK_NAME)
+description: HAOS app recovery notification; replace NETWORK_NAME with the existing MQTT network namespace.
+triggers:
+  - trigger: mqtt
+    topic: casambi/NETWORK_NAME/recovery
+conditions:
+  - condition: template
+    value_template: >-
+      {% set p = trigger.payload_json | default({}) %}
+      {{ p is mapping
+         and p.get('protocol_version') is integer
+         and p.get('protocol_version') == 1
+         and p.get('incident_id') is string
+         and 0 < p.get('incident_id') | length <= 64
+         and p.get('attempts') is integer
+         and 0 <= p.get('attempts') <= 3
+         and (p.get('state') == 'failed'
+              or (p.get('state') == 'armed' and p.get('attempts') == 0)) }}
+actions:
+  - choose:
+      - conditions: "{{ trigger.payload_json.state == 'failed' }}"
+        sequence:
+          - action: persistent_notification.create
+            data:
+              notification_id: casambi_bridge_recovery_NETWORK_NAME
+              title: Casambi-silta tarvitsee huomiota
+              message: >-
+                Casambi-sillan automaattinen palautus on pysäytetty.
+                Käytettyjä palautusyrityksiä: {{ trigger.payload_json.attempts }}/3.
+                Tarkista Casambi MQTT Bridge -sovelluksen loki ja korjaa vian syy.
+                Tunnus- tai asetusvirhe voi pysäyttää palautuksen jo ennen yrityksiä.
+                Kuittaa palautus vasta korjauksen jälkeen kasvattamalla sovelluksen
+                recovery_reset_generation-arvoa ja käynnistämällä sovellus uudelleen.
+      - conditions: "{{ trigger.payload_json.state == 'armed' }}"
+        sequence:
+          - action: persistent_notification.dismiss
+            data:
+              notification_id: casambi_bridge_recovery_NETWORK_NAME
+mode: single
