@@ -1,0 +1,19 @@
+name: Casambi MQTT Bridge (experimental)
+version: "0.2.10-haos.1"
+slug: casambi_bridge
+description: Opt-in native Bluetooth bridge with a read-only preflight mode
+url: https://github.com/kaikkone4/casambi-mqtt
+arch:
+  - aarch64
+startup: application
+boot: manual_only
+host_dbus: true
+host_network: false
+init: true
+apparmor: true
+options:
+  mode: disabled
+  env: ""
+schema:
+  mode: list(disabled|preflight|bridge)
+  env: password

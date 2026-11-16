@@ -1,0 +1,55 @@
+name: HAOS app
+
+on:
+  push:
+    branches: [main, feat/haos-bridge-app]
+    paths:
+      - 'haos_casambi/**'
+      - 'tests/test_haos_*.py'
+      - '.github/workflows/haos.yml'
+      - 'Dockerfile'
+      - 'repository.yaml'
+  pull_request:
+    paths:
+      - 'haos_casambi/**'
+      - 'tests/test_haos_*.py'
+      - '.github/workflows/haos.yml'
+      - 'Dockerfile'
+      - 'repository.yaml'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      PYTHON_DOTENV_DISABLED: '1'
+    steps:
+      - uses: actions/checkout@v7.0.1
+      - uses: actions/setup-python@v7.0.0
+        with:
+          python-version: '3.13'
+      - name: Unit and packaging contracts
+        run: |
+          python -m pip install -r requirements-server.txt pytest pytest-asyncio pyyaml
+          python -m pytest -q tests/test_haos_entrypoint.py tests/test_haos_packaging.py
+      - name: Build exact app context
+        run: docker build --tag casambi-haos:smoke haos_casambi
+      - name: Real standalone imports, no HA or network
+        run: |
+          docker run --rm --network none --entrypoint python casambi-haos:smoke -c 'import importlib.util; assert importlib.util.find_spec("homeassistant") is None; import server; print("Standalone bridge import OK")'
+      - name: Disabled has no network or radio
+        run: docker run --rm --network none casambi-haos:smoke
+      - name: Missing configuration fails closed with EX_CONFIG
+        shell: bash
+        run: |
+          mkdir -p "$RUNNER_TEMP/casambi-data"
+          printf '%s\n' '{"mode":"bridge"}' > "$RUNNER_TEMP/casambi-data/options.json"
+          set +e
+          docker run --rm --network none -v "$RUNNER_TEMP/casambi-data:/data" casambi-haos:smoke
+          code=$?
+          set -e
+          test "$code" -eq 78
