@@ -65,6 +65,13 @@ You need all of the following:
 
 The Home Assistant custom component and Bluetooth bridge are separate deployments. Installing this repository in HACS does **not** install or start the bridge.
 
+## Choose the bridge deployment
+
+- **Independent Linux host:** keep the existing systemd installation and dedicated-host recovery policy.
+- **Shared HAOS host:** use the separately versioned [HAOS app](haos_casambi/DOCS.md), with app-only supervision and a persistent three-replacement limit; it never reboots Home Assistant/the host or resets global BlueZ.
+
+Both profiles use the same maintained bridge and MQTT/entity identities. Run only one bridge per Casambi network namespace. See [deployment modes](docs/deployment-modes.md); installing HACS alone does not install either bridge profile.
+
 ## Install the Home Assistant integration with HACS
 
 This repository is currently distributed as a **HACS custom repository**.

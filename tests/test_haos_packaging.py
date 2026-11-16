@@ -8,10 +8,14 @@ ROOT = Path(__file__).resolve().parents[1]
 APP = ROOT / "haos_casambi"
 
 
-def test_manifest_is_manual_dbus_only_and_has_no_privileged_defaults():
+def test_manifest_autostarts_with_internal_liveness_and_no_privileged_defaults():
     config = yaml.safe_load((APP / "config.yaml").read_text())
     assert config["arch"] == ["aarch64"]
-    assert config["boot"] == "manual_only"
+    assert config["boot"] == "auto"
+    assert config["version"] == "0.2.10-haos.2"
+    assert config["watchdog"] == "http://[HOST]:[PORT:8099]/supervisor-health"
+    assert config["timeout"] == 30
+    assert not any(config.get("ports", {}).values())
     assert config["startup"] == "application"
     assert config["host_dbus"] is True
     assert config["host_network"] is False
@@ -28,9 +32,14 @@ def test_manifest_is_manual_dbus_only_and_has_no_privileged_defaults():
         "map",
     ):
         assert not config.get(key)
-    assert config["options"] == {"mode": "disabled", "env": ""}
+    assert config["options"] == {
+        "mode": "disabled",
+        "env": "",
+        "recovery_reset_generation": 0,
+    }
     assert config["schema"]["mode"] == "list(disabled|preflight|bridge)"
     assert config["schema"]["env"] == "password"
+    assert config["schema"]["recovery_reset_generation"] == "int(0,1000000)"
     assert "image" not in config  # No unconfigured registry credentials needed.
 
 
@@ -57,7 +66,8 @@ def test_app_build_pins_and_verifies_existing_bridge_source():
     ):
         assert path in docker
     assert "COPY run.py" in docker
-    assert 'ENTRYPOINT ["python", "/app/haos_run.py"]' in docker
+    assert "bridge_supervisor.py" in docker
+    assert 'ENTRYPOINT ["python", "/app/bridge_supervisor.py"]' in docker
     assert "__init__.py" not in docker
 
 
@@ -84,15 +94,21 @@ def test_docs_explain_private_restore_and_real_bridge_control_boundary():
 
 def test_ci_exercises_real_isolated_container_without_publish_permissions():
     workflow = (ROOT / ".github/workflows/haos.yml").read_text()
+    smoke = (ROOT / "tests/haos_container_smoke.py").read_text()
+    executable = workflow + smoke
+    assert "python tests/haos_container_smoke.py" in workflow
     for marker in (
         "docker build",
         "docker run",
         "--network none",
         "--entrypoint python",
         "import server",
-        "78",
+        "supervisor-health",
+        '"exec"',
+        "latched",
+        "test_haos_supervisor.py",
         "test_haos_entrypoint.py",
     ):
-        assert marker in workflow
+        assert marker in executable
     assert "packages: write" not in workflow
     assert "docker push" not in workflow

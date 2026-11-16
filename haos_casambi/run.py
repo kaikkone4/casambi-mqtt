@@ -11,11 +11,13 @@ import re
 import sys
 from io import StringIO
 from pathlib import Path
+from typing import Any
 
 MIN_PORT = 1
 MAX_PORT = 65535
 MIN_HEARTBEAT = 5
 MAX_HEARTBEAT = 300
+MAX_RESET_GENERATION = 1000000
 REQUIRED_ENV = (
     "MQTT_BROKER",
     "MQTT_PORT",
@@ -125,9 +127,16 @@ def bridge_environment(
     return values
 
 
-def _read_options(options_path: Path) -> dict[str, str]:
+def _read_options(options_path: Path) -> dict[str, Any]:
     options = json.loads(options_path.read_text()) if options_path.exists() else {}
-    if not isinstance(options, dict) or set(options) - {"mode", "env"}:
+    if not isinstance(options, dict) or set(options) - {
+        "mode",
+        "env",
+        "recovery_reset_generation",
+    }:
+        raise ValueError
+    generation = options.get("recovery_reset_generation", 0)
+    if type(generation) is not int or not 0 <= generation <= MAX_RESET_GENERATION:
         raise ValueError
     if options.get("mode", "disabled") not in ("disabled", "preflight", "bridge"):
         raise ValueError

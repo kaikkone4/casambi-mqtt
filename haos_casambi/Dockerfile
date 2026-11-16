@@ -14,5 +14,5 @@ RUN printf '%s  %s\n' d63f26c655465eda33e57f02b297abcf65f91b814897a9504aff625057
 
 LABEL io.casambi.bridge.revision="e5e3fd661740479489c7ed797f5707a031feaa5f"
 WORKDIR /app
-COPY run.py /app/haos_run.py
-ENTRYPOINT ["python", "/app/haos_run.py"]
+COPY run.py bridge_supervisor.py /app/
+ENTRYPOINT ["python", "/app/bridge_supervisor.py"]

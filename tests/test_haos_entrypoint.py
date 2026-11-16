@@ -17,6 +17,22 @@ ROOT = Path(__file__).resolve().parents[1]
 LAUNCHER = ROOT / "haos_casambi" / "run.py"
 
 
+@pytest.mark.parametrize("generation", [0, 1, 1000000])
+def test_valid_recovery_generation_preserves_inert_disabled(tmp_path, generation):
+    (tmp_path / "options.json").write_text(
+        json.dumps({"mode": "disabled", "recovery_reset_generation": generation})
+    )
+    assert load_launcher().main(data_dir=tmp_path) == 0
+
+
+@pytest.mark.parametrize("generation", [-1, 1000001, True, None, "1"])
+def test_invalid_recovery_generation_fails_closed(tmp_path, generation):
+    (tmp_path / "options.json").write_text(
+        json.dumps({"mode": "disabled", "recovery_reset_generation": generation})
+    )
+    assert load_launcher().main(data_dir=tmp_path) == 78
+
+
 def load_launcher():
     assert LAUNCHER.is_file(), "HAOS launcher is not implemented"
     spec = importlib.util.spec_from_file_location("haos_launcher", LAUNCHER)
